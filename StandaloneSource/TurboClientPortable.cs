@@ -137,11 +137,11 @@ namespace TurboClient
             _btnListenReverse = CreateToolbarButton("📡 Listen Mode (9877)", 634, 8, 155, 28, Color.FromArgb(95, 65, 160));
             _btnListenReverse.Click += async (s, e) => await StartReverseListenerAsync();
 
-            Label lblMode = new Label { Text = "Speed Profile:", Location = new Point(800, 13), AutoSize = true };
+            Label lblMode = new Label { Text = "Profile:", Location = new Point(798, 13), AutoSize = true };
             _cmbBandwidth = new ComboBox
             {
-                Location = new Point(888, 10),
-                Width = 195,
+                Location = new Point(850, 10),
+                Width = 235,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(16, 18, 26),
                 ForeColor = Color.FromArgb(255, 220, 120)
@@ -159,8 +159,8 @@ namespace TurboClient
 
             _chkGrayscale = new CheckBox
             {
-                Text = "Turbo Gray",
-                Location = new Point(1094, 12),
+                Text = "Gray",
+                Location = new Point(1095, 12),
                 AutoSize = true,
                 ForeColor = Color.FromArgb(190, 205, 230)
             };

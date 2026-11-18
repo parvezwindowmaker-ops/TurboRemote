@@ -536,6 +536,9 @@ namespace TurboCore
         private const int DESKTOPHORZRES = 118;
         private const int DESKTOPVERTRES = 117;
 
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
         public static Rectangle GetPhysicalMonitorBounds(int monitorIndex)
         {
             System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
@@ -547,25 +550,30 @@ namespace TurboCore
 
             Rectangle logical = screens[monIdx].Bounds;
 
-            // Also query physical desktop resolution in case DPI virtualization is active
-            if (monIdx == 0)
+            try
             {
-                try
+                IntPtr hdc = GetDC(IntPtr.Zero);
+                if (hdc != IntPtr.Zero)
                 {
-                    IntPtr hdc = GetDC(IntPtr.Zero);
-                    if (hdc != IntPtr.Zero)
+                    int physW = GetDeviceCaps(hdc, DESKTOPHORZRES);
+                    int physH = GetDeviceCaps(hdc, DESKTOPVERTRES);
+                    ReleaseDC(IntPtr.Zero, hdc);
+                    if (physW > 0 && physH > 0 && logical.Width > 0)
                     {
-                        int physW = GetDeviceCaps(hdc, DESKTOPHORZRES);
-                        int physH = GetDeviceCaps(hdc, DESKTOPVERTRES);
-                        ReleaseDC(IntPtr.Zero, hdc);
-                        if (physW > logical.Width && physH > logical.Height)
+                        float scaleX = (float)physW / (float)screens[0].Bounds.Width;
+                        float scaleY = (float)physH / (float)screens[0].Bounds.Height;
+                        if (scaleX > 1.01f || scaleY > 1.01f)
                         {
-                            return new Rectangle(logical.X, logical.Y, physW, physH);
+                            return new Rectangle(
+                                (int)Math.Round(logical.X * scaleX),
+                                (int)Math.Round(logical.Y * scaleY),
+                                (int)Math.Round(logical.Width * scaleX),
+                                (int)Math.Round(logical.Height * scaleY));
                         }
                     }
                 }
-                catch { }
             }
+            catch { }
 
             return logical;
         }
@@ -870,15 +878,8 @@ namespace TurboCore
 
         public static void EnableHighDpiAwareness()
         {
-            try
-            {
-                // PROCESS_PER_MONITOR_DPI_AWARE = 2
-                SetProcessDpiAwareness(2);
-            }
-            catch
-            {
-                try { SetProcessDPIAware(); } catch { }
-            }
+            // Keep Windows Forms at 96-DPI logical coordinates so pixel-positioned buttons/text never clip!
+            // Physical screen resolution is queried directly via gdi32 GetDeviceCaps(DESKTOPHORZRES/DESKTOPVERTRES).
         }
 
         public static void PreventSystemSleep()
@@ -1326,32 +1327,46 @@ namespace TurboCore
 
         public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin = "2580")
         {
-            string expandedInput = hostInput != null ? hostInput.Trim() : "";
+            string rawInput = hostInput != null ? hostInput.Trim() : "";
+            List<EndpointCandidate> candidates = new List<EndpointCandidate>();
 
-            // If user entered a Host ID / Room Code (e.g., "PC-OFFICE" or "@MYPC" or simple word without dots/colons)
-            bool looksLikeHostId = !string.IsNullOrEmpty(expandedInput) &&
-                                   !expandedInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
-                                   !expandedInput.Contains(".") &&
-                                   !expandedInput.Contains(":");
-
-            if (looksLikeHostId || expandedInput.StartsWith("@"))
+            // 1. Always add direct parse of whatever the user typed (IP, Windows Machine Name like WM-DEV-07, or comma-separated list)
+            if (!string.IsNullOrEmpty(rawInput) && !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase))
             {
-                string cleanRoom = expandedInput.TrimStart('@');
-                string cloudTicket = await ResolveHostTicketFromCloudAsync(cleanRoom, pin);
-                if (!string.IsNullOrWhiteSpace(cloudTicket))
+                candidates.AddRange(ParseCandidates(rawInput.TrimStart('@'), defaultPort));
+            }
+
+            // 2. Run UDP Local LAN Broadcast Discovery in parallel (300ms max)
+            Task<List<EndpointCandidate>> lanTask = DiscoverLanHostsAsync(300);
+
+            // 3. If input is a Host ID / Machine Name (no dots), ALSO check Cloud Rendezvous in parallel with a strict 1.5s cap
+            bool looksLikeHostId = !string.IsNullOrEmpty(rawInput) &&
+                                   !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
+                                   !rawInput.Contains(".") &&
+                                   !rawInput.Contains(":");
+
+            if (looksLikeHostId || rawInput.StartsWith("@"))
+            {
+                string cleanRoom = rawInput.TrimStart('@');
+                Task<string> cloudTask = ResolveHostTicketFromCloudAsync(cleanRoom, pin);
+                Task completed = await Task.WhenAny(cloudTask, Task.Delay(1400));
+                if (completed == cloudTask && !string.IsNullOrWhiteSpace(cloudTask.Result))
                 {
-                    expandedInput = cloudTicket;
+                    foreach (EndpointCandidate cc in ParseCandidates(cloudTask.Result, defaultPort))
+                    {
+                        if (!candidates.Any(c => c.Host == cc.Host && c.Port == cc.Port))
+                            candidates.Add(cc);
+                    }
                 }
             }
 
-            List<EndpointCandidate> candidates = ParseCandidates(expandedInput, defaultPort);
-
-            // Also run ultra-fast UDP LAN broadcast discovery in parallel so if the Host is on the same Wi-Fi/LAN, local always wins!
-            List<EndpointCandidate> lanFound = await DiscoverLanHostsAsync(320);
+            List<EndpointCandidate> lanFound = await lanTask;
             foreach (EndpointCandidate lan in lanFound)
             {
-                bool exists = candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port);
-                if (!exists) candidates.Insert(0, lan);
+                if (!candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port))
+                {
+                    candidates.Insert(0, lan);
+                }
             }
 
             if (candidates.Count == 0)
@@ -1359,7 +1374,7 @@ namespace TurboCore
                 candidates.Add(new EndpointCandidate { Host = "127.0.0.1", Port = defaultPort, RouteLabel = "Localhost" });
             }
 
-            // Race all endpoints concurrently (Happy Eyeballs algorithm)
+            // 4. Race all candidates concurrently (Direct Hostname/LAN IP + Discovered LAN + Cloud WAN)
             List<Task<KeyValuePair<TcpClient, EndpointCandidate>>> tasks = new List<Task<KeyValuePair<TcpClient, EndpointCandidate>>>();
             foreach (EndpointCandidate cand in candidates)
             {
@@ -1368,25 +1383,30 @@ namespace TurboCore
                 {
                     TcpClient tcp = new TcpClient();
                     tcp.NoDelay = true;
-                    // Give LAN endpoints a 0ms headstart, WAN endpoints a 45ms stagger so local LAN always wins if reachable
-                    if (c.RouteLabel.Contains("Internet"))
-                    {
-                        await Task.Delay(45);
-                    }
                     await tcp.ConnectAsync(c.Host, c.Port);
                     return new KeyValuePair<TcpClient, EndpointCandidate>(tcp, c);
                 }));
             }
 
+            Task timeoutGuard = Task.Delay(4500);
             Exception lastErr = null;
             while (tasks.Count > 0)
             {
-                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = await Task.WhenAny(tasks);
+                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = null;
+                List<Task> waitList = new List<Task>(tasks);
+                waitList.Add(timeoutGuard);
+
+                Task first = await Task.WhenAny(waitList);
+                if (first == timeoutGuard)
+                {
+                    throw new TimeoutException("Connection timed out reaching " + rawInput + ":" + defaultPort + " (Verify TurboRemote Host is running).");
+                }
+
+                finished = (Task<KeyValuePair<TcpClient, EndpointCandidate>>)first;
                 tasks.Remove(finished);
                 try
                 {
                     KeyValuePair<TcpClient, EndpointCandidate> winner = await finished;
-                    // Close any slower connections that complete afterwards
                     foreach (var remaining in tasks)
                     {
                         var _ = remaining.ContinueWith(t =>
