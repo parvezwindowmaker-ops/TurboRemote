@@ -19,8 +19,22 @@ namespace TurboClient
         public DoubleBufferedPanel()
         {
             DoubleBuffered = true;
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+            // Selectable so a click gives the remote view keyboard focus (a plain Panel cannot take focus,
+            // so keys kept going to whatever toolbar control had it).
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
+            TabStop = true;
             UpdateStyles();
+        }
+
+        /// <summary>True while a remote session is live.</summary>
+        public bool CaptureAllKeys { get; set; }
+
+        // While connected, treat every key as input so arrow keys, Tab, Enter and Escape raise KeyDown/KeyUp (and
+        // get forwarded to the host) instead of being consumed locally for focus navigation. While disconnected,
+        // keep normal behaviour so Tab can still move focus away from the canvas.
+        protected override bool IsInputKey(Keys keyData)
+        {
+            return CaptureAllKeys || base.IsInputKey(keyData);
         }
     }
 
@@ -66,10 +80,14 @@ namespace TurboClient
         private long _bytesThisSec = 0;
         private double _currentKbps = 0;
         private long _lastPingRttMs = 0;
-        private long _lastMouseMoveSentTick = 0;
+        // Stopwatch, not Environment.TickCount: TickCount goes negative after 24.9 days of uptime, and the
+        // "now - last < 8" throttle then dropped every mouse move until the PC was rebooted.
+        private readonly Stopwatch _mouseMoveClock = Stopwatch.StartNew();
+        private long _lastMouseMoveSentMs = -1000;
 
         private FileStream _downloadingStream;
         private string _downloadingFilePath;
+        private bool _uploadInProgress;
 
         public ClientMainForm()
         {
@@ -499,6 +517,9 @@ namespace TurboClient
                 _reverseListener = null;
                 _btnListenReverse.Text = "📡 Listen Mode (9877)";
 
+                // Replacing a live session in place left its receive loop reading the new stream.
+                if (_isConnected || _isConnecting) Disconnect();
+
                 await InitializeActiveSessionAsync(client, new EndpointCandidate
                 {
                     Host = client.Client.RemoteEndPoint.ToString(),
@@ -577,13 +598,22 @@ namespace TurboClient
             await SendStreamConfigAsync();
             await RequestRemoteFileListAsync("DEFAULT");
 
-            Task.Run(() => ReceivePacketsLoopAsync(_sessionCts.Token));
+            // Give the remote view keyboard focus so typing goes to the host right away.
+            _screenCanvas.CaptureAllKeys = true;
+            if (_tabControl.SelectedIndex == 0) _screenCanvas.Focus();
+
+            // Hand this session's stream/keys/token to its loop, so it can never pick up a later session's.
+            NetworkStream sessionStream = _stream;
+            SecurityContext sessionSec = _sec;
+            CancellationToken sessionToken = _sessionCts.Token;
+            Task.Run(() => ReceivePacketsLoopAsync(sessionStream, sessionSec, sessionToken));
         }
 
         private void Disconnect()
         {
             _isConnected = false;
             _isConnecting = false;
+            _screenCanvas.CaptureAllKeys = false;
             try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
             try { if (_stream != null) _stream.Dispose(); } catch { }
@@ -596,13 +626,13 @@ namespace TurboClient
             _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
         }
 
-        private async Task ReceivePacketsLoopAsync(CancellationToken ct)
+        private async Task ReceivePacketsLoopAsync(NetworkStream stream, SecurityContext sec, CancellationToken ct)
         {
             try
             {
                 while (!ct.IsCancellationRequested && _isConnected)
                 {
-                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(_stream, ct, _sec);
+                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(stream, ct, sec);
                     if (pkt == null) break;
 
                     PacketType type = pkt.Value.Key;
@@ -659,9 +689,11 @@ namespace TurboClient
             catch { }
             finally
             {
-                if (!IsDisposed)
+                // Only when the HOST ended the session. After a user Disconnect the token is already cancelled,
+                // and a late Disconnect here could tear down (or cancel) a connection the user had just started.
+                if (!ct.IsCancellationRequested && !IsDisposed)
                 {
-                    BeginInvoke(new Action(Disconnect));
+                    try { BeginInvoke(new Action(Disconnect)); } catch (InvalidOperationException) { }
                 }
             }
         }
@@ -716,9 +748,9 @@ namespace TurboClient
         private async void OnCanvasMouseMove(object sender, MouseEventArgs e)
         {
             if (!_isConnected) return;
-            long now = Environment.TickCount;
-            if (now - _lastMouseMoveSentTick < 8) return; // 120 Hz ultra-responsive cursor tracking
-            _lastMouseMoveSentTick = now;
+            long now = _mouseMoveClock.ElapsedMilliseconds;
+            if (now - _lastMouseMoveSentMs < 8) return; // 120 Hz ultra-responsive cursor tracking
+            _lastMouseMoveSentMs = now;
 
             float nx, ny;
             GetNormalizedCanvasCoords(e.X, e.Y, out nx, out ny);
@@ -761,7 +793,9 @@ namespace TurboClient
             if (_isConnected && _tabControl.SelectedIndex == 0 && !_txtHostIp.Focused && !_txtPort.Focused && !_txtPin.Focused)
             {
                 e.Handled = true;
-                Task.Run(() => SendKeyPacketAsync((ushort)e.KeyValue, true));
+                // Start the send right here on the UI thread so packets queue in keystroke order. Task.Run let a
+                // key-up overtake its key-down, leaving keys (Shift, Ctrl...) stuck down on the host.
+                Task send = SendKeyPacketAsync((ushort)e.KeyValue, true);
                 return;
             }
             base.OnKeyDown(e);
@@ -772,7 +806,7 @@ namespace TurboClient
             if (_isConnected && _tabControl.SelectedIndex == 0 && !_txtHostIp.Focused && !_txtPort.Focused && !_txtPin.Focused)
             {
                 e.Handled = true;
-                Task.Run(() => SendKeyPacketAsync((ushort)e.KeyValue, false));
+                Task send = SendKeyPacketAsync((ushort)e.KeyValue, false);
                 return;
             }
             base.OnKeyUp(e);
@@ -865,36 +899,63 @@ namespace TurboClient
         private async Task UploadLocalFileToHostAsync()
         {
             if (!_isConnected) return;
+            if (_uploadInProgress)
+            {
+                // Two uploads at once interleaved their chunks on the host and corrupted the file.
+                _lblFileStatus.Text = " An upload is already in progress. Please wait for it to finish.";
+                return;
+            }
+
             using (OpenFileDialog ofd = new OpenFileDialog())
             {
                 if (ofd.ShowDialog() != DialogResult.OK) return;
 
-                string localPath = ofd.FileName;
-                string remoteFolder = _txtRemotePath.Text.Trim();
-                if (string.IsNullOrEmpty(remoteFolder) || remoteFolder == "DEFAULT")
-                    remoteFolder = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-                string targetRemotePath = Path.Combine(remoteFolder, Path.GetFileName(localPath));
-                _lblFileStatus.Text = " Uploading " + Path.GetFileName(localPath) + "...";
-
-                await SendPacketSafeAsync(PacketType.FileUploadStart, Encoding.UTF8.GetBytes(targetRemotePath));
-
-                byte[] buffer = new byte[64 * 1024];
-                using (FileStream fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                _uploadInProgress = true;
+                try
                 {
-                    int read;
-                    while ((read = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                    {
-                        byte[] slice = new byte[read];
-                        Buffer.BlockCopy(buffer, 0, slice, 0, read);
-                        byte[] compressed = TurboProtocol.CompressFast(slice);
-                        await SendPacketSafeAsync(PacketType.FileUploadChunk, compressed);
-                    }
-                }
+                    string localPath = ofd.FileName;
+                    string remoteFolder = _txtRemotePath.Text.Trim();
+                    bool useHostDefaultFolder = string.IsNullOrEmpty(remoteFolder) || remoteFolder == "DEFAULT";
 
-                await SendPacketSafeAsync(PacketType.FileUploadEnd, new byte[0]);
-                _lblFileStatus.Text = " Upload completed: " + targetRemotePath;
-                await RequestRemoteFileListAsync(remoteFolder);
+                    // For the default folder send only the file name; the host puts it in ITS profile folder.
+                    // (This used to send THIS PC's profile path, which may not exist on the host.)
+                    string targetRemotePath = useHostDefaultFolder
+                        ? Path.GetFileName(localPath)
+                        : Path.Combine(remoteFolder, Path.GetFileName(localPath));
+                    _lblFileStatus.Text = " Uploading " + Path.GetFileName(localPath) + "...";
+
+                    await SendPacketSafeAsync(PacketType.FileUploadStart, Encoding.UTF8.GetBytes(targetRemotePath));
+
+                    byte[] buffer = new byte[64 * 1024];
+                    using (FileStream fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    {
+                        int read;
+                        while ((read = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                        {
+                            if (!_isConnected)
+                            {
+                                _lblFileStatus.Text = " Upload interrupted: disconnected from host.";
+                                return;
+                            }
+                            byte[] slice = new byte[read];
+                            Buffer.BlockCopy(buffer, 0, slice, 0, read);
+                            byte[] compressed = TurboProtocol.CompressFast(slice);
+                            await SendPacketSafeAsync(PacketType.FileUploadChunk, compressed);
+                        }
+                    }
+
+                    await SendPacketSafeAsync(PacketType.FileUploadEnd, new byte[0]);
+                    _lblFileStatus.Text = " Upload completed: " + targetRemotePath;
+                    await RequestRemoteFileListAsync(useHostDefaultFolder ? "DEFAULT" : remoteFolder);
+                }
+                catch (Exception ex)
+                {
+                    _lblFileStatus.Text = " Upload failed: " + ex.Message;
+                }
+                finally
+                {
+                    _uploadInProgress = false;
+                }
             }
         }
 
