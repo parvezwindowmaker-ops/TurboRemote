@@ -1,0 +1,1456 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace TurboCore
+{
+    public enum PacketType : byte
+    {
+        AuthChallenge = 1,
+        AuthResponse = 2,
+        AuthResult = 21,
+        ScreenFrame = 3,
+        MouseInput = 4,
+        KeyInput = 5,
+        ConfigUpdate = 6,
+        ShellExec = 7,
+        ShellOutput = 8,
+        FileUploadStart = 9,
+        FileUploadChunk = 10,
+        FileUploadEnd = 11,
+        FileDownloadRequest = 12,
+        FileListRequest = 13,
+        FileListResponse = 14,
+        ClipboardSync = 15,
+        SystemAction = 16,
+        Ping = 17,
+        Pong = 18,
+        ForceFullFrame = 19,
+        InputLockToggle = 20
+    }
+
+    public enum BandwidthProfile : byte
+    {
+        UltraLow_2G = 0,     // 38% scale, Grayscale + 16-Level Posterized, JPEG Q=18, 10 FPS (~8-20 KB/s)
+        Low_3G = 1,          // 52% scale, Color JPEG Q=32, 15 FPS
+        Balanced_4G = 2,     // 75% scale, Color JPEG Q=50, 24 FPS
+        Turbo_Broadband = 3, // 100% scale, Color JPEG Q=78, 35 FPS
+        AutoAdaptive = 4     // Automatically shifts scale, color, and FPS based on real-time socket latency
+    }
+
+    public enum MouseActionType : byte
+    {
+        Move = 0,
+        LeftDown = 1,
+        LeftUp = 2,
+        RightDown = 3,
+        RightUp = 4,
+        MiddleDown = 5,
+        MiddleUp = 6,
+        Wheel = 7
+    }
+
+    public class StreamConfig
+    {
+        public BandwidthProfile Profile = BandwidthProfile.AutoAdaptive;
+        public float Scale = 0.65f;
+        public long JpegQuality = 45;
+        public bool Grayscale = false;
+        public bool LowBitPosterize = false;
+        public int TargetFps = 20;
+        public int MonitorIndex = 0;
+
+        public void ApplyPreset(BandwidthProfile profile)
+        {
+            Profile = profile;
+            switch (profile)
+            {
+                case BandwidthProfile.UltraLow_2G:
+                    Scale = 0.38f;
+                    JpegQuality = 18;
+                    Grayscale = true;
+                    LowBitPosterize = true;
+                    TargetFps = 10;
+                    break;
+                case BandwidthProfile.Low_3G:
+                    Scale = 0.52f;
+                    JpegQuality = 32;
+                    Grayscale = false;
+                    LowBitPosterize = false;
+                    TargetFps = 15;
+                    break;
+                case BandwidthProfile.Balanced_4G:
+                    Scale = 0.75f;
+                    JpegQuality = 50;
+                    Grayscale = false;
+                    LowBitPosterize = false;
+                    TargetFps = 24;
+                    break;
+                case BandwidthProfile.Turbo_Broadband:
+                    Scale = 1.0f;
+                    JpegQuality = 78;
+                    Grayscale = false;
+                    LowBitPosterize = false;
+                    TargetFps = 35;
+                    break;
+            }
+        }
+    }
+
+    public class SecurityContext : IDisposable
+    {
+        public readonly byte[] EncKey;
+        public readonly byte[] MacKey;
+        private long _sendSeq = 0;
+        private long _recvSeq = 0;
+
+        public SecurityContext(string secretPinOrPassword, byte[] salt16, byte[] challenge16)
+        {
+            // Derive 512 bits (32B AES-256 Key + 32B HMAC-SHA256 Key) via PBKDF2-SHA256
+            byte[] combinedSalt = new byte[salt16.Length + challenge16.Length];
+            Buffer.BlockCopy(salt16, 0, combinedSalt, 0, salt16.Length);
+            Buffer.BlockCopy(challenge16, 0, combinedSalt, salt16.Length, challenge16.Length);
+
+            using (Rfc2898DeriveBytes kdf = new Rfc2898DeriveBytes(secretPinOrPassword.Trim(), combinedSalt, 15000, HashAlgorithmName.SHA256))
+            {
+                EncKey = kdf.GetBytes(32);
+                MacKey = kdf.GetBytes(32);
+            }
+        }
+
+        public byte[] ComputeHandshakeProof(byte[] challenge16, string roleTag)
+        {
+            using (HMACSHA256 hmac = new HMACSHA256(MacKey))
+            {
+                byte[] tagBytes = Encoding.UTF8.GetBytes(roleTag);
+                byte[] buf = new byte[challenge16.Length + tagBytes.Length];
+                Buffer.BlockCopy(challenge16, 0, buf, 0, challenge16.Length);
+                Buffer.BlockCopy(tagBytes, 0, buf, challenge16.Length, tagBytes.Length);
+                return hmac.ComputeHash(buf);
+            }
+        }
+
+        public byte[] EncryptAndAuthenticate(PacketType type, byte[] plainPayload)
+        {
+            if (plainPayload == null) plainPayload = new byte[0];
+            long seq = Interlocked.Increment(ref _sendSeq);
+
+            byte[] iv = new byte[16];
+            using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(iv);
+            }
+
+            byte[] cipherBytes;
+            using (Aes aes = Aes.Create())
+            {
+                aes.KeySize = 256;
+                aes.Key = EncKey;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (ICryptoTransform enc = aes.CreateEncryptor())
+                {
+                    cipherBytes = enc.TransformFinalBlock(plainPayload, 0, plainPayload.Length);
+                }
+            }
+
+            // Envelope: [8B Sequence][16B IV][32B HMAC-SHA256][CipherBytes]
+            byte[] seqBytes = BitConverter.GetBytes(seq);
+            byte[] mac;
+            using (HMACSHA256 hmac = new HMACSHA256(MacKey))
+            {
+                hmac.TransformBlock( new byte[] { (byte)type }, 0, 1, null, 0);
+                hmac.TransformBlock(seqBytes, 0, 8, null, 0);
+                hmac.TransformBlock(iv, 0, 16, null, 0);
+                hmac.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
+                mac = hmac.Hash;
+            }
+
+            byte[] envelope = new byte[8 + 16 + 32 + cipherBytes.Length];
+            Buffer.BlockCopy(seqBytes, 0, envelope, 0, 8);
+            Buffer.BlockCopy(iv, 0, envelope, 8, 16);
+            Buffer.BlockCopy(mac, 0, envelope, 24, 32);
+            Buffer.BlockCopy(cipherBytes, 0, envelope, 56, cipherBytes.Length);
+            return envelope;
+        }
+
+        public byte[] VerifyAndDecrypt(PacketType type, byte[] envelope)
+        {
+            if (envelope == null || envelope.Length < 56)
+            {
+                throw new CryptographicException("Encrypted packet truncated or malformed.");
+            }
+
+            long seq = BitConverter.ToInt64(envelope, 0);
+            long expectedMin = Interlocked.Read(ref _recvSeq);
+            if (seq <= expectedMin)
+            {
+                throw new CryptographicException("Replay attack detected: duplicate or out-of-order sequence number.");
+            }
+
+            byte[] seqBytes = new byte[8];
+            byte[] iv = new byte[16];
+            byte[] receivedMac = new byte[32];
+            int cipherLen = envelope.Length - 56;
+            byte[] cipherBytes = new byte[cipherLen];
+
+            Buffer.BlockCopy(envelope, 0, seqBytes, 0, 8);
+            Buffer.BlockCopy(envelope, 8, iv, 0, 16);
+            Buffer.BlockCopy(envelope, 24, receivedMac, 0, 32);
+            Buffer.BlockCopy(envelope, 56, cipherBytes, 0, cipherLen);
+
+            byte[] computedMac;
+            using (HMACSHA256 hmac = new HMACSHA256(MacKey))
+            {
+                hmac.TransformBlock(new byte[] { (byte)type }, 0, 1, null, 0);
+                hmac.TransformBlock(seqBytes, 0, 8, null, 0);
+                hmac.TransformBlock(iv, 0, 16, null, 0);
+                hmac.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
+                computedMac = hmac.Hash;
+            }
+
+            if (!TurboProtocol.ConstantTimeEquals(receivedMac, computedMac))
+            {
+                throw new CryptographicException("HMAC-SHA256 integrity verification failed (tampered packet).");
+            }
+
+            Interlocked.Exchange(ref _recvSeq, seq);
+
+            using (Aes aes = Aes.Create())
+            {
+                aes.KeySize = 256;
+                aes.Key = EncKey;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (ICryptoTransform dec = aes.CreateDecryptor())
+                {
+                    return dec.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (EncKey != null) Array.Clear(EncKey, 0, EncKey.Length);
+            if (MacKey != null) Array.Clear(MacKey, 0, MacKey.Length);
+        }
+    }
+
+    public static class BruteForceProtector
+    {
+        private class AttemptRecord
+        {
+            public int Failures;
+            public DateTime LockoutUntilUtc;
+        }
+
+        private static readonly ConcurrentDictionary<string, AttemptRecord> _records = new ConcurrentDictionary<string, AttemptRecord>();
+
+        public static bool IsIpLockedOut(string ip, out int remainingSeconds)
+        {
+            remainingSeconds = 0;
+            AttemptRecord rec;
+            if (_records.TryGetValue(ip, out rec))
+            {
+                lock (rec)
+                {
+                    if (DateTime.UtcNow < rec.LockoutUntilUtc)
+                    {
+                        remainingSeconds = Math.Max(1, (int)(rec.LockoutUntilUtc - DateTime.UtcNow).TotalSeconds);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        public static int RecordFailedAttempt(string ip)
+        {
+            AttemptRecord rec = _records.GetOrAdd(ip, _ => new AttemptRecord());
+            lock (rec)
+            {
+                rec.Failures++;
+                if (rec.Failures >= 5)
+                {
+                    rec.LockoutUntilUtc = DateTime.UtcNow.AddMinutes(5);
+                }
+                return rec.Failures;
+            }
+        }
+
+        public static void ResetAttempts(string ip)
+        {
+            AttemptRecord removed;
+            _records.TryRemove(ip, out removed);
+        }
+    }
+
+    public static class TurboProtocol
+    {
+        private static readonly byte[] MagicHeader = new byte[] { 0x54, 0x52, 0x42, 0x4F }; // 'TRBO'
+
+        public static string GenerateStrongAccessKey()
+        {
+            const string chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            byte[] rand = new byte[8];
+            using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(rand);
+            }
+            char[] outChars = new char[9];
+            for (int i = 0; i < 4; i++) outChars[i] = chars[rand[i] % chars.Length];
+            outChars[4] = '-';
+            for (int i = 4; i < 8; i++) outChars[i + 1] = chars[rand[i] % chars.Length];
+            return new string(outChars);
+        }
+
+        public static bool ConstantTimeEquals(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++)
+            {
+                diff |= (a[i] ^ b[i]);
+            }
+            return diff == 0;
+        }
+
+        public static byte[] CompressFast(byte[] data)
+        {
+            if (data == null || data.Length == 0) return new byte[0];
+            using (MemoryStream ms = new MemoryStream())
+            {
+                using (DeflateStream ds = new DeflateStream(ms, CompressionLevel.Fastest, true))
+                {
+                    ds.Write(data, 0, data.Length);
+                }
+                return ms.ToArray();
+            }
+        }
+
+        public static byte[] DecompressFast(byte[] compressed)
+        {
+            if (compressed == null || compressed.Length == 0) return new byte[0];
+            using (MemoryStream input = new MemoryStream(compressed))
+            using (DeflateStream ds = new DeflateStream(input, CompressionMode.Decompress))
+            using (MemoryStream output = new MemoryStream())
+            {
+                ds.CopyTo(output);
+                return output.ToArray();
+            }
+        }
+
+        public static async Task SendPacketAsync(Stream stream, SemaphoreSlim writeLock, PacketType type, byte[] payload, CancellationToken ct, SecurityContext sec = null)
+        {
+            if (payload == null) payload = new byte[0];
+            byte[] wirePayload = (sec != null) ? sec.EncryptAndAuthenticate(type, payload) : payload;
+
+            byte[] header = new byte[9];
+            Buffer.BlockCopy(MagicHeader, 0, header, 0, 4);
+            header[4] = (byte)type;
+            byte[] lenBytes = BitConverter.GetBytes(wirePayload.Length);
+            Buffer.BlockCopy(lenBytes, 0, header, 5, 4);
+
+            await writeLock.WaitAsync(ct);
+            try
+            {
+                await stream.WriteAsync(header, 0, header.Length, ct);
+                if (wirePayload.Length > 0)
+                {
+                    await stream.WriteAsync(wirePayload, 0, wirePayload.Length, ct);
+                }
+                await stream.FlushAsync(ct);
+            }
+            finally
+            {
+                writeLock.Release();
+            }
+        }
+
+        public static async Task<KeyValuePair<PacketType, byte[]>?> ReadPacketAsync(Stream stream, CancellationToken ct, SecurityContext sec = null)
+        {
+            byte[] header = new byte[9];
+            int read = await ReadExactAsync(stream, header, 0, 9, ct);
+            if (read < 9) return null;
+
+            if (header[0] != MagicHeader[0] || header[1] != MagicHeader[1] ||
+                header[2] != MagicHeader[2] || header[3] != MagicHeader[3])
+            {
+                throw new InvalidDataException("Invalid TurboRemote packet header.");
+            }
+
+            PacketType type = (PacketType)header[4];
+            int length = BitConverter.ToInt32(header, 5);
+            if (length < 0 || length > 64 * 1024 * 1024)
+            {
+                throw new InvalidDataException("Invalid packet length: " + length);
+            }
+
+            byte[] wirePayload = new byte[length];
+            if (length > 0)
+            {
+                int payloadRead = await ReadExactAsync(stream, wirePayload, 0, length, ct);
+                if (payloadRead < length) return null;
+            }
+
+            byte[] plainPayload = (sec != null) ? sec.VerifyAndDecrypt(type, wirePayload) : wirePayload;
+            return new KeyValuePair<PacketType, byte[]>(type, plainPayload);
+        }
+
+        private static async Task<int> ReadExactAsync(Stream stream, byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int n = await stream.ReadAsync(buffer, offset + total, count - total, ct);
+                if (n <= 0) break;
+                total += n;
+            }
+            return total;
+        }
+    }
+
+    public struct TilePatch
+    {
+        public ushort GridX;
+        public ushort GridY;
+        public ushort Width;
+        public ushort Height;
+        public byte[] JpegBytes;
+    }
+
+    public class DeltaScreenEncoder : IDisposable
+    {
+        public const int GridCols = 8;
+        public const int GridRows = 8;
+
+        private readonly ulong[,] _prevTileHashes = new ulong[GridCols, GridRows];
+        private int _lastScaledWidth = 0;
+        private int _lastScaledHeight = 0;
+        private bool _lastGrayscale = false;
+        private int _lastMonitorIndex = -1;
+        private int _frameCounter = 0;
+
+        private readonly ImageCodecInfo _jpegEncoder;
+        private readonly EncoderParameters _encoderParams;
+        private long _currentQuality = -1;
+
+        private Bitmap _rawCaptureBmp;
+        private Graphics _rawCaptureGfx;
+        private Bitmap _scaledBmp;
+        private Graphics _scaledGfx;
+
+        public DeltaScreenEncoder()
+        {
+            foreach (ImageCodecInfo codec in ImageCodecInfo.GetImageEncoders())
+            {
+                if (codec.FormatID == ImageFormat.Jpeg.Guid)
+                {
+                    _jpegEncoder = codec;
+                    break;
+                }
+            }
+            _encoderParams = new EncoderParameters(1);
+        }
+
+        public void ForceFullKeyFrame()
+        {
+            _lastScaledWidth = 0;
+            _lastScaledHeight = 0;
+        }
+
+        private void EnsureQuality(long quality)
+        {
+            if (quality < 10L) quality = 10L;
+            if (quality > 95L) quality = 95L;
+            if (_currentQuality != quality)
+            {
+                _currentQuality = quality;
+                _encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
+            }
+        }
+
+        private void EnsureBuffers(int nativeW, int nativeH, int scaledW, int scaledH)
+        {
+            if (_rawCaptureBmp == null || _rawCaptureBmp.Width != nativeW || _rawCaptureBmp.Height != nativeH)
+            {
+                if (_rawCaptureGfx != null) _rawCaptureGfx.Dispose();
+                if (_rawCaptureBmp != null) _rawCaptureBmp.Dispose();
+                _rawCaptureBmp = new Bitmap(nativeW, nativeH, PixelFormat.Format32bppRgb);
+                _rawCaptureGfx = Graphics.FromImage(_rawCaptureBmp);
+            }
+
+            if (_scaledBmp == null || _scaledBmp.Width != scaledW || _scaledBmp.Height != scaledH)
+            {
+                if (_scaledGfx != null) _scaledGfx.Dispose();
+                if (_scaledBmp != null) _scaledBmp.Dispose();
+                _scaledBmp = new Bitmap(scaledW, scaledH, PixelFormat.Format24bppRgb);
+                _scaledGfx = Graphics.FromImage(_scaledBmp);
+                _scaledGfx.InterpolationMode = InterpolationMode.Bilinear;
+                _scaledGfx.CompositingQuality = CompositingQuality.HighSpeed;
+                _scaledGfx.SmoothingMode = SmoothingMode.None;
+            }
+        }
+
+        public unsafe byte[] CaptureAndEncodeDelta(StreamConfig config, out int changedTilesCount, out int nativeWidth, out int nativeHeight)
+        {
+            changedTilesCount = 0;
+            System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
+            if (screens.Length == 0)
+            {
+                nativeWidth = 1280;
+                nativeHeight = 720;
+                return new byte[0];
+            }
+
+            int monIdx = config.MonitorIndex;
+            if (monIdx < 0) monIdx = 0;
+            if (monIdx >= screens.Length) monIdx = screens.Length - 1;
+
+            Rectangle bounds = screens[monIdx].Bounds;
+            nativeWidth = bounds.Width;
+            nativeHeight = bounds.Height;
+
+            int scaledW = Math.Max(320, ((int)(nativeWidth * config.Scale)) & ~7);
+            int scaledH = Math.Max(240, ((int)(nativeHeight * config.Scale)) & ~7);
+
+            bool forceFull = (_lastScaledWidth != scaledW ||
+                              _lastScaledHeight != scaledH ||
+                              _lastGrayscale != config.Grayscale ||
+                              _lastMonitorIndex != monIdx ||
+                              (_frameCounter % 180 == 0));
+
+            _lastScaledWidth = scaledW;
+            _lastScaledHeight = scaledH;
+            _lastGrayscale = config.Grayscale;
+            _lastMonitorIndex = monIdx;
+            _frameCounter++;
+
+            EnsureQuality(config.JpegQuality);
+            EnsureBuffers(nativeWidth, nativeHeight, scaledW, scaledH);
+
+            _rawCaptureGfx.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
+            DrawCursorOverlay(_rawCaptureGfx, bounds.X, bounds.Y);
+            _scaledGfx.DrawImage(_rawCaptureBmp, 0, 0, scaledW, scaledH);
+
+            int tileW = scaledW / GridCols;
+            int tileH = scaledH / GridRows;
+
+            BitmapData bmpData = _scaledBmp.LockBits(new Rectangle(0, 0, scaledW, scaledH), ImageLockMode.ReadWrite, PixelFormat.Format24bppRgb);
+            ulong[,] newHashes = new ulong[GridCols, GridRows];
+            bool[,] isDirty = new bool[GridCols, GridRows];
+
+            try
+            {
+                byte* basePtr = (byte*)bmpData.Scan0;
+                int stride = bmpData.Stride;
+
+                if (config.Grayscale || config.LowBitPosterize)
+                {
+                    byte mask = config.LowBitPosterize ? (byte)0xE0 : (byte)0xF8;
+                    for (int y = 0; y < scaledH; y++)
+                    {
+                        byte* row = basePtr + (y * stride);
+                        for (int x = 0; x < scaledW * 3; x += 3)
+                        {
+                            if (config.Grayscale)
+                            {
+                                byte lum = (byte)(((row[x + 2] * 77) + (row[x + 1] * 150) + (row[x] * 29)) >> 8);
+                                lum &= mask;
+                                row[x] = lum;
+                                row[x + 1] = lum;
+                                row[x + 2] = lum;
+                            }
+                            else
+                            {
+                                row[x] &= mask;
+                                row[x + 1] &= mask;
+                                row[x + 2] &= mask;
+                            }
+                        }
+                    }
+                }
+
+                for (int gy = 0; gy < GridRows; gy++)
+                {
+                    int startY = gy * tileH;
+                    int h = (gy == GridRows - 1) ? (scaledH - startY) : tileH;
+
+                    for (int gx = 0; gx < GridCols; gx++)
+                    {
+                        int startX = gx * tileW;
+                        int w = (gx == GridCols - 1) ? (scaledW - startX) : tileW;
+
+                        ulong hash = 14695981039346656037UL;
+                        for (int y = startY; y < startY + h; y += 2)
+                        {
+                            byte* row = basePtr + (y * stride) + (startX * 3);
+                            for (int x = 0; x < w * 3; x += 6)
+                            {
+                                ulong b0 = (ulong)(row[x] & 0xF8);
+                                ulong b1 = (ulong)(row[x + 1] & 0xF8);
+                                ulong b2 = (ulong)(row[x + 2] & 0xF8);
+                                ulong sample = (b0 << 16) | (b1 << 8) | b2;
+                                hash ^= sample;
+                                hash *= 1099511628211UL;
+                            }
+                        }
+
+                        newHashes[gx, gy] = hash;
+                        if (forceFull || _prevTileHashes[gx, gy] != hash)
+                        {
+                            isDirty[gx, gy] = true;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                _scaledBmp.UnlockBits(bmpData);
+            }
+
+            List<TilePatch> dirtyPatches = new List<TilePatch>(GridCols * GridRows);
+            for (int gy = 0; gy < GridRows; gy++)
+            {
+                int startY = gy * tileH;
+                int h = (gy == GridRows - 1) ? (scaledH - startY) : tileH;
+
+                for (int gx = 0; gx < GridCols; gx++)
+                {
+                    if (!isDirty[gx, gy]) continue;
+
+                    int startX = gx * tileW;
+                    int w = (gx == GridCols - 1) ? (scaledW - startX) : tileW;
+
+                    using (Bitmap tileBmp = _scaledBmp.Clone(new Rectangle(startX, startY, w, h), PixelFormat.Format24bppRgb))
+                    using (MemoryStream tileMs = new MemoryStream(4096))
+                    {
+                        tileBmp.Save(tileMs, _jpegEncoder, _encoderParams);
+                        dirtyPatches.Add(new TilePatch
+                        {
+                            GridX = (ushort)startX,
+                            GridY = (ushort)startY,
+                            Width = (ushort)w,
+                            Height = (ushort)h,
+                            JpegBytes = tileMs.ToArray()
+                        });
+                    }
+                    _prevTileHashes[gx, gy] = newHashes[gx, gy];
+                }
+            }
+
+            changedTilesCount = dirtyPatches.Count;
+            if (changedTilesCount == 0)
+            {
+                return new byte[0];
+            }
+
+            using (MemoryStream packetMs = new MemoryStream(16384))
+            using (BinaryWriter bw = new BinaryWriter(packetMs))
+            {
+                bw.Write((ushort)nativeWidth);
+                bw.Write((ushort)nativeHeight);
+                bw.Write((ushort)scaledW);
+                bw.Write((ushort)scaledH);
+                bw.Write((byte)(forceFull ? 1 : 0));
+                bw.Write((ushort)dirtyPatches.Count);
+
+                foreach (TilePatch patch in dirtyPatches)
+                {
+                    bw.Write(patch.GridX);
+                    bw.Write(patch.GridY);
+                    bw.Write(patch.Width);
+                    bw.Write(patch.Height);
+                    bw.Write(patch.JpegBytes.Length);
+                    bw.Write(patch.JpegBytes);
+                }
+
+                bw.Flush();
+                return TurboProtocol.CompressFast(packetMs.ToArray());
+            }
+        }
+
+        public static void ApplyDeltaFrame(byte[] compressedPayload, ref Bitmap canvasBitmap, out int nativeWidth, out int nativeHeight, out int scaledWidth, out int scaledHeight, out int updatedTiles)
+        {
+            byte[] raw = TurboProtocol.DecompressFast(compressedPayload);
+            using (MemoryStream ms = new MemoryStream(raw))
+            using (BinaryReader br = new BinaryReader(ms))
+            {
+                nativeWidth = br.ReadUInt16();
+                nativeHeight = br.ReadUInt16();
+                scaledWidth = br.ReadUInt16();
+                scaledHeight = br.ReadUInt16();
+                byte isKeyFrame = br.ReadByte();
+                updatedTiles = br.ReadUInt16();
+
+                if (canvasBitmap == null || canvasBitmap.Width != scaledWidth || canvasBitmap.Height != scaledHeight)
+                {
+                    if (canvasBitmap != null) canvasBitmap.Dispose();
+                    canvasBitmap = new Bitmap(scaledWidth, scaledHeight, PixelFormat.Format24bppRgb);
+                }
+
+                using (Graphics g = Graphics.FromImage(canvasBitmap))
+                {
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    for (int i = 0; i < updatedTiles; i++)
+                    {
+                        int x = br.ReadUInt16();
+                        int y = br.ReadUInt16();
+                        int w = br.ReadUInt16();
+                        int h = br.ReadUInt16();
+                        int len = br.ReadInt32();
+                        byte[] jpeg = br.ReadBytes(len);
+
+                        using (MemoryStream tileStream = new MemoryStream(jpeg))
+                        using (Image tileImg = Image.FromStream(tileStream))
+                        {
+                            g.DrawImage(tileImg, x, y, w, h);
+                        }
+                    }
+                }
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CURSORINFO
+        {
+            public int cbSize;
+            public int flags;
+            public IntPtr hCursor;
+            public POINT ptScreenPos;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorInfo(out CURSORINFO pci);
+
+        [DllImport("user32.dll")]
+        private static extern bool DrawIcon(IntPtr hDC, int X, int Y, IntPtr hIcon);
+
+        private const int CURSOR_SHOWING = 0x00000001;
+
+        private static void DrawCursorOverlay(Graphics g, int offsetX, int offsetY)
+        {
+            try
+            {
+                CURSORINFO pci;
+                pci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
+                if (GetCursorInfo(out pci) && (pci.flags & CURSOR_SHOWING) != 0)
+                {
+                    IntPtr hdc = g.GetHdc();
+                    try
+                    {
+                        DrawIcon(hdc, pci.ptScreenPos.X - offsetX, pci.ptScreenPos.Y - offsetY, pci.hCursor);
+                    }
+                    finally
+                    {
+                        g.ReleaseHdc(hdc);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            if (_encoderParams != null) _encoderParams.Dispose();
+            if (_rawCaptureGfx != null) _rawCaptureGfx.Dispose();
+            if (_rawCaptureBmp != null) _rawCaptureBmp.Dispose();
+            if (_scaledGfx != null) _scaledGfx.Dispose();
+            if (_scaledBmp != null) _scaledBmp.Dispose();
+        }
+    }
+
+    public static class NativeInputInjector
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetCursorPos(int X, int Y);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool BlockInput(bool fBlockIt);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint SetThreadExecutionState(uint esFlags);
+
+        public const uint ES_CONTINUOUS = 0x80000000;
+        public const uint ES_SYSTEM_REQUIRED = 0x00000001;
+        public const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+        private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+        private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+        private const uint MOUSEEVENTF_WHEEL = 0x0800;
+
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        public static void PreventSystemSleep()
+        {
+            try
+            {
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            }
+            catch { }
+        }
+
+        public static bool IsRunningAsAdmin()
+        {
+            try
+            {
+                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+                {
+                    WindowsPrincipal principal = new WindowsPrincipal(identity);
+                    return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool RestartAsAdmin(string arguments)
+        {
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = arguments,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                };
+                Process.Start(psi);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool InstallUnattendedAdminStartupTask(string port, string pin)
+        {
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                string args = string.Format("/Create /F /RL HIGHEST /SC ONLOGON /TN \"TurboRemote_Unattended_Host\" /TR \"\\\"{0}\\\" --port {1} --pin {2}\"", exePath, port, pin);
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "schtasks.exe",
+                    Arguments = args,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(4000);
+                    return p.ExitCode == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void InjectMouse(MouseActionType action, float normX, float normY, int wheelDelta, int monitorIndex)
+        {
+            try
+            {
+                System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
+                if (screens.Length == 0) return;
+
+                int idx = monitorIndex;
+                if (idx < 0) idx = 0;
+                if (idx >= screens.Length) idx = screens.Length - 1;
+                Rectangle bounds = screens[idx].Bounds;
+
+                if (normX < 0f) normX = 0f;
+                if (normX > 1f) normX = 1f;
+                if (normY < 0f) normY = 0f;
+                if (normY > 1f) normY = 1f;
+
+                int targetX = bounds.X + (int)Math.Round(normX * bounds.Width);
+                int targetY = bounds.Y + (int)Math.Round(normY * bounds.Height);
+
+                SetCursorPos(targetX, targetY);
+
+                switch (action)
+                {
+                    case MouseActionType.LeftDown:
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.LeftUp:
+                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.RightDown:
+                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.RightUp:
+                        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.MiddleDown:
+                        mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.MiddleUp:
+                        mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+                        break;
+                    case MouseActionType.Wheel:
+                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheelDelta, UIntPtr.Zero);
+                        break;
+                }
+            }
+            catch { }
+        }
+
+        public static void InjectKey(ushort virtualKeyCode, bool isKeyDown)
+        {
+            try
+            {
+                byte vk = (byte)(virtualKeyCode & 0xFF);
+                uint flags = isKeyDown ? 0u : KEYEVENTF_KEYUP;
+                if (IsExtendedKey(vk))
+                {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                keybd_event(vk, 0, flags, UIntPtr.Zero);
+            }
+            catch { }
+        }
+
+        private static bool IsExtendedKey(byte vk)
+        {
+            return vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 ||
+                   vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 ||
+                   vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C;
+        }
+
+        public static void SendSpecialCombo(string comboName)
+        {
+            switch (comboName)
+            {
+                case "WIN_D":
+                    InjectKey(0x5B, true);
+                    InjectKey(0x44, true);
+                    InjectKey(0x44, false);
+                    InjectKey(0x5B, false);
+                    break;
+                case "ALT_TAB":
+                    InjectKey(0x12, true);
+                    InjectKey(0x09, true);
+                    InjectKey(0x09, false);
+                    InjectKey(0x12, false);
+                    break;
+                case "TASK_MGR":
+                    InjectKey(0x11, true);
+                    InjectKey(0x10, true);
+                    InjectKey(0x1B, true);
+                    InjectKey(0x1B, false);
+                    InjectKey(0x10, false);
+                    InjectKey(0x11, false);
+                    break;
+                case "ALT_F4":
+                    InjectKey(0x12, true);
+                    InjectKey(0x73, true);
+                    InjectKey(0x73, false);
+                    InjectKey(0x12, false);
+                    break;
+                case "WIN_R":
+                    InjectKey(0x5B, true);
+                    InjectKey(0x52, true);
+                    InjectKey(0x52, false);
+                    InjectKey(0x5B, false);
+                    break;
+                case "LOCK_INPUT_ON":
+                    BlockInput(true);
+                    break;
+                case "LOCK_INPUT_OFF":
+                    BlockInput(false);
+                    break;
+            }
+        }
+    }
+
+    public class EndpointCandidate
+    {
+        public string Host;
+        public int Port;
+        public string RouteLabel; // "LAN", "P2P/Tailscale", "WAN/Internet"
+    }
+
+    public static class SmartRouteEngine
+    {
+        public const int DiscoveryUdpPort = 9878;
+
+        private static string DeriveRendezvousUrl(string roomCode, string pin)
+        {
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] raw = Encoding.UTF8.GetBytes("TURBOREMOTE_CLOUD_DIRECTORY_V1::" + roomCode.Trim().ToUpperInvariant() + "::" + pin.Trim());
+                byte[] hash = sha.ComputeHash(raw);
+                StringBuilder hex = new StringBuilder(32);
+                for (int i = 0; i < 16; i++) hex.Append(hash[i].ToString("x2"));
+                return "https://ntfy.sh/trbo_" + hex.ToString();
+            }
+        }
+
+        public static string EncryptTicketForCloud(string plainTicket, string pin)
+        {
+            byte[] salt = Encoding.UTF8.GetBytes("TRBO_CLOUD_SALT!");
+            byte[] chal = Encoding.UTF8.GetBytes("TRBO_CLOUD_CHAL!");
+            using (SecurityContext sec = new SecurityContext(pin, salt, chal))
+            {
+                byte[] enc = sec.EncryptAndAuthenticate(PacketType.AuthChallenge, Encoding.UTF8.GetBytes(plainTicket));
+                return "TRBO_TICKET_V1:" + Convert.ToBase64String(enc);
+            }
+        }
+
+        public static string DecryptTicketFromCloud(string line, string pin)
+        {
+            int idx = line.IndexOf("TRBO_TICKET_V1:");
+            if (idx < 0) return null;
+            string b64 = line.Substring(idx + "TRBO_TICKET_V1:".Length).Trim();
+            int quoteIdx = b64.IndexOf('"');
+            if (quoteIdx > 0) b64 = b64.Substring(0, quoteIdx);
+
+            byte[] env = Convert.FromBase64String(b64);
+            byte[] salt = Encoding.UTF8.GetBytes("TRBO_CLOUD_SALT!");
+            byte[] chal = Encoding.UTF8.GetBytes("TRBO_CLOUD_CHAL!");
+            using (SecurityContext sec = new SecurityContext(pin, salt, chal))
+            {
+                byte[] plain = sec.VerifyAndDecrypt(PacketType.AuthChallenge, env);
+                return Encoding.UTF8.GetString(plain);
+            }
+        }
+
+        public static async Task<bool> PublishHostTicketToCloudAsync(string roomCode, string pin, string ticket)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                string url = DeriveRendezvousUrl(roomCode, pin);
+                string encryptedPayload = EncryptTicketForCloud(ticket, pin);
+
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "POST";
+                req.Timeout = 6000;
+                byte[] data = Encoding.UTF8.GetBytes(encryptedPayload);
+                req.ContentLength = data.Length;
+                using (Stream s = await req.GetRequestStreamAsync())
+                {
+                    await s.WriteAsync(data, 0, data.Length);
+                }
+                using (WebResponse resp = await req.GetResponseAsync())
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static async Task<string> ResolveHostTicketFromCloudAsync(string roomCode, string pin)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                string url = DeriveRendezvousUrl(roomCode, pin) + "/raw?poll=1&since=12h";
+
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = 5000;
+                using (WebResponse resp = await req.GetResponseAsync())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                {
+                    string all = await sr.ReadToEndAsync();
+                    string[] lines = all.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    // Read latest published ticket from bottom to top
+                    for (int i = lines.Length - 1; i >= 0; i--)
+                    {
+                        try
+                        {
+                            string decrypted = DecryptTicketFromCloud(lines[i], pin);
+                            if (!string.IsNullOrWhiteSpace(decrypted))
+                            {
+                                return decrypted;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        public static List<string> GetRawHostIps()
+        {
+            List<string> rawIps = new List<string>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    foreach (UnicastIPAddressInformation addr in props.UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            rawIps.Add(addr.Address.ToString());
+                        }
+                    }
+                }
+            }
+            catch { }
+            return rawIps;
+        }
+
+        public static string BuildSmartConnectTicket(int tcpPort, string publicTunnelHostPort = "")
+        {
+            List<string> endpoints = new List<string>();
+            foreach (string ip in GetRawHostIps())
+            {
+                endpoints.Add(ip + ":" + tcpPort);
+            }
+            if (!string.IsNullOrWhiteSpace(publicTunnelHostPort))
+            {
+                endpoints.Add(publicTunnelHostPort.Trim());
+            }
+            if (endpoints.Count == 0)
+            {
+                endpoints.Add("127.0.0.1:" + tcpPort);
+            }
+            return string.Join(",", endpoints);
+        }
+
+        public static void StartLanBeaconResponder(Func<int> getTcpPort, CancellationToken ct)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    using (UdpClient udp = new UdpClient(DiscoveryUdpPort))
+                    {
+                        while (!ct.IsCancellationRequested)
+                        {
+                            UdpReceiveResult res = await udp.ReceiveAsync();
+                            string msg = Encoding.UTF8.GetString(res.Buffer);
+                            if (msg == "TRBO_DISCOVER")
+                            {
+                                string reply = "TRBO_HOST|" + Environment.MachineName + "|" + getTcpPort();
+                                byte[] replyBytes = Encoding.UTF8.GetBytes(reply);
+                                await udp.SendAsync(replyBytes, replyBytes.Length, res.RemoteEndPoint);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }, ct);
+        }
+
+        public static async Task<List<EndpointCandidate>> DiscoverLanHostsAsync(int timeoutMs = 450)
+        {
+            List<EndpointCandidate> found = new List<EndpointCandidate>();
+            try
+            {
+                using (UdpClient udp = new UdpClient())
+                {
+                    udp.EnableBroadcast = true;
+                    byte[] probe = Encoding.UTF8.GetBytes("TRBO_DISCOVER");
+                    await udp.SendAsync(probe, probe.Length, new IPEndPoint(IPAddress.Broadcast, DiscoveryUdpPort));
+
+                    Stopwatch sw = Stopwatch.StartNew();
+                    while (sw.ElapsedMilliseconds < timeoutMs)
+                    {
+                        Task<UdpReceiveResult> recvTask = udp.ReceiveAsync();
+                        Task done = await Task.WhenAny(recvTask, Task.Delay(Math.Max(50, timeoutMs - (int)sw.ElapsedMilliseconds)));
+                        if (done != recvTask) break;
+
+                        string text = Encoding.UTF8.GetString(recvTask.Result.Buffer);
+                        if (text.StartsWith("TRBO_HOST|"))
+                        {
+                            string[] parts = text.Split('|');
+                            int port = parts.Length > 2 ? int.Parse(parts[2]) : 9876;
+                            string ip = recvTask.Result.RemoteEndPoint.Address.ToString();
+                            found.Add(new EndpointCandidate
+                            {
+                                Host = ip,
+                                Port = port,
+                                RouteLabel = "Auto-Discovered Local LAN (" + parts[1] + ")"
+                            });
+                        }
+                    }
+                }
+            }
+            catch { }
+            return found;
+        }
+
+        public static List<EndpointCandidate> ParseCandidates(string hostInput, int defaultPort)
+        {
+            List<EndpointCandidate> list = new List<EndpointCandidate>();
+            if (string.IsNullOrWhiteSpace(hostInput)) return list;
+
+            string[] tokens = hostInput.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string rawToken in tokens)
+            {
+                string clean = rawToken.Trim().Replace("tcp://", "").Replace("http://", "");
+                if (clean.Equals("AUTO", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string host = clean;
+                int port = defaultPort;
+                int colonIdx = clean.LastIndexOf(':');
+                if (colonIdx > 0 && colonIdx < clean.Length - 1)
+                {
+                    int parsedPort;
+                    if (int.TryParse(clean.Substring(colonIdx + 1), out parsedPort))
+                    {
+                        host = clean.Substring(0, colonIdx);
+                        port = parsedPort;
+                    }
+                }
+
+                string label = ClassifyRoute(host);
+                list.Add(new EndpointCandidate { Host = host, Port = port, RouteLabel = label });
+            }
+            return list;
+        }
+
+        private static string ClassifyRoute(string host)
+        {
+            if (host == "127.0.0.1" || host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+                return "Localhost Loopback";
+            if (host.StartsWith("192.168.") || host.StartsWith("10.") || host.StartsWith("172."))
+                return "Direct Local LAN";
+            if (host.StartsWith("100."))
+                return "Direct P2P Tailscale/WireGuard WAN";
+            return "Public Internet / WAN Tunnel";
+        }
+
+        public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin = "2580")
+        {
+            string expandedInput = hostInput != null ? hostInput.Trim() : "";
+
+            // If user entered a Host ID / Room Code (e.g., "PC-OFFICE" or "@MYPC" or simple word without dots/colons)
+            bool looksLikeHostId = !string.IsNullOrEmpty(expandedInput) &&
+                                   !expandedInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
+                                   !expandedInput.Contains(".") &&
+                                   !expandedInput.Contains(":");
+
+            if (looksLikeHostId || expandedInput.StartsWith("@"))
+            {
+                string cleanRoom = expandedInput.TrimStart('@');
+                string cloudTicket = await ResolveHostTicketFromCloudAsync(cleanRoom, pin);
+                if (!string.IsNullOrWhiteSpace(cloudTicket))
+                {
+                    expandedInput = cloudTicket;
+                }
+            }
+
+            List<EndpointCandidate> candidates = ParseCandidates(expandedInput, defaultPort);
+
+            // Also run ultra-fast UDP LAN broadcast discovery in parallel so if the Host is on the same Wi-Fi/LAN, local always wins!
+            List<EndpointCandidate> lanFound = await DiscoverLanHostsAsync(320);
+            foreach (EndpointCandidate lan in lanFound)
+            {
+                bool exists = candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port);
+                if (!exists) candidates.Insert(0, lan);
+            }
+
+            if (candidates.Count == 0)
+            {
+                candidates.Add(new EndpointCandidate { Host = "127.0.0.1", Port = defaultPort, RouteLabel = "Localhost" });
+            }
+
+            // Race all endpoints concurrently (Happy Eyeballs algorithm)
+            List<Task<KeyValuePair<TcpClient, EndpointCandidate>>> tasks = new List<Task<KeyValuePair<TcpClient, EndpointCandidate>>>();
+            foreach (EndpointCandidate cand in candidates)
+            {
+                EndpointCandidate c = cand;
+                tasks.Add(Task.Run(async () =>
+                {
+                    TcpClient tcp = new TcpClient();
+                    tcp.NoDelay = true;
+                    // Give LAN endpoints a 0ms headstart, WAN endpoints a 45ms stagger so local LAN always wins if reachable
+                    if (c.RouteLabel.Contains("Internet"))
+                    {
+                        await Task.Delay(45);
+                    }
+                    await tcp.ConnectAsync(c.Host, c.Port);
+                    return new KeyValuePair<TcpClient, EndpointCandidate>(tcp, c);
+                }));
+            }
+
+            Exception lastErr = null;
+            while (tasks.Count > 0)
+            {
+                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = await Task.WhenAny(tasks);
+                tasks.Remove(finished);
+                try
+                {
+                    KeyValuePair<TcpClient, EndpointCandidate> winner = await finished;
+                    // Close any slower connections that complete afterwards
+                    foreach (var remaining in tasks)
+                    {
+                        var _ = remaining.ContinueWith(t =>
+                        {
+                            if (t.Status == TaskStatus.RanToCompletion && t.Result.Key != null)
+                            {
+                                try { t.Result.Key.Close(); } catch { }
+                            }
+                        });
+                    }
+                    return winner;
+                }
+                catch (Exception ex)
+                {
+                    lastErr = ex;
+                }
+            }
+
+            throw lastErr ?? new SocketException();
+        }
+    }
+
+    public static class NetworkHelper
+    {
+        public static List<string> GetLocalIpAddresses()
+        {
+            List<string> ips = new List<string>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    foreach (UnicastIPAddressInformation addr in props.UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            string ip = addr.Address.ToString();
+                            string label = (ni.Name.IndexOf("Tailscale", StringComparison.OrdinalIgnoreCase) >= 0 || ip.StartsWith("100."))
+                                ? string.Format("{0} (Tailscale / Direct P2P WAN)", ip)
+                                : string.Format("{0} ({1})", ip, ni.Name);
+                            ips.Add(label);
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (ips.Count == 0)
+            {
+                ips.Add("127.0.0.1 (Localhost)");
+            }
+            return ips;
+        }
+
+        public static bool EnsureFirewallRule(string ruleName, int port)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = string.Format("advfirewall firewall add rule name=\"{0}\" dir=in action=allow protocol=TCP localport={1}", ruleName, port),
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (Process proc = Process.Start(psi))
+                {
+                    proc.WaitForExit(3000);
+                    return proc.ExitCode == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static async Task<string> TryUpnpPortForwardAsync(int internalPort, int externalPort)
+        {
+            try
+            {
+                string ssdpRequest =
+                    "M-SEARCH * HTTP/1.1\r\n" +
+                    "HOST: 239.255.255.250:1900\r\n" +
+                    "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" +
+                    "MAN: \"ssdp:discover\"\r\n" +
+                    "MX: 2\r\n\r\n";
+
+                using (UdpClient udp = new UdpClient())
+                {
+                    byte[] reqBytes = Encoding.ASCII.GetBytes(ssdpRequest);
+                    IPEndPoint multicastEp = new IPEndPoint(IPAddress.Parse("239.255.255.250"), 1900);
+                    await udp.SendAsync(reqBytes, reqBytes.Length, multicastEp);
+
+                    Task<UdpReceiveResult> receiveTask = udp.ReceiveAsync();
+                    Task completed = await Task.WhenAny(receiveTask, Task.Delay(2200));
+                    if (completed != receiveTask)
+                    {
+                        return "UPnP router discovery timed out (Use Tailscale, Public Tunnel, or Reverse Connect).";
+                    }
+
+                    string response = Encoding.ASCII.GetString(receiveTask.Result.Buffer);
+                    foreach (string line in response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        if (line.StartsWith("LOCATION:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string loc = line.Substring(9).Trim();
+                            return string.Format("UPnP Gateway detected at {0}. Port {1} ready.", loc, externalPort);
+                        }
+                    }
+                    return "UPnP gateway responded.";
+                }
+            }
+            catch (Exception ex)
+            {
+                return "UPnP status: " + ex.Message;
+            }
+        }
+    }
+}
