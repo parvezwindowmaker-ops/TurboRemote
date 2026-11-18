@@ -51,8 +51,10 @@ namespace TurboClient
         private SecurityContext _sec;
         private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
         private CancellationTokenSource _sessionCts;
+        private CancellationTokenSource _connectCts;
         private TcpListener _reverseListener;
         private bool _isConnected = false;
+        private bool _isConnecting = false;
         private bool _remoteInputLocked = false;
 
         private Bitmap _remoteBitmap;
@@ -412,8 +414,14 @@ namespace TurboClient
 
         private async Task ToggleConnectAsync()
         {
-            if (_isConnected) Disconnect();
-            else await ConnectToHostAsync();
+            if (_isConnected || _isConnecting)
+            {
+                Disconnect();
+            }
+            else
+            {
+                await ConnectToHostAsync();
+            }
         }
 
         private async Task ConnectToHostAsync()
@@ -426,27 +434,47 @@ namespace TurboClient
                 return;
             }
 
+            _isConnecting = true;
+            _connectCts = new CancellationTokenSource();
+            _btnConnect.Text = "✖ Stop / Cancel";
+            _btnConnect.BackColor = Color.FromArgb(195, 110, 30);
+            _btnConnect.Enabled = true;
+
             try
             {
-                _btnConnect.Enabled = false;
-                _lblTelemetry.Text = "● SMART-ROUTING: Racing Local LAN + P2P + Internet endpoints...";
+                _lblTelemetry.Text = "● CONNECTING TO " + hostInput + " (Click '✖ Stop / Cancel' to abort)...";
                 _lblTelemetry.ForeColor = Color.FromArgb(110, 220, 255);
 
-                KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(hostInput, port, _txtPin.Text.Trim());
+                KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(hostInput, port, _txtPin.Text.Trim(), _connectCts.Token);
                 TcpClient client = winner.Key;
                 EndpointCandidate route = winner.Value;
 
                 await InitializeActiveSessionAsync(client, route);
             }
+            catch (OperationCanceledException)
+            {
+                _lblTelemetry.Text = "● CONNECTION CANCELLED BY USER.";
+                _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
+                ResetConnectButton();
+            }
             catch (Exception ex)
             {
                 _lblTelemetry.Text = "● CONNECTION FAILED: " + ex.Message;
                 _lblTelemetry.ForeColor = Color.FromArgb(255, 110, 110);
+                ResetConnectButton();
             }
             finally
             {
-                _btnConnect.Enabled = true;
+                _isConnecting = false;
             }
+        }
+
+        private void ResetConnectButton()
+        {
+            _isConnecting = false;
+            _btnConnect.Enabled = true;
+            _btnConnect.Text = "⚡ Connect to Host";
+            _btnConnect.BackColor = Color.FromArgb(30, 145, 90);
         }
 
         private async Task StartReverseListenerAsync()
@@ -555,14 +583,15 @@ namespace TurboClient
         private void Disconnect()
         {
             _isConnected = false;
+            _isConnecting = false;
+            try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
             try { if (_stream != null) _stream.Dispose(); } catch { }
             try { if (_tcpClient != null) _tcpClient.Close(); } catch { }
             try { if (_downloadingStream != null) _downloadingStream.Dispose(); } catch { }
             try { if (_sec != null) { _sec.Dispose(); _sec = null; } } catch { }
 
-            _btnConnect.Text = "⚡ Connect to Host";
-            _btnConnect.BackColor = Color.FromArgb(30, 145, 90);
+            ResetConnectButton();
             _lblTelemetry.Text = "● DISCONNECTED";
             _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
         }

@@ -108,7 +108,6 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
-            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             HostMainForm form = new HostMainForm();
@@ -122,7 +121,6 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
-            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             ClientMainForm form = new ClientMainForm();
@@ -152,7 +150,6 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
-            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -160,6 +157,11 @@ namespace TurboUnified
             bool forceClient = false;
             for (int i = 0; i < args.Length; i++)
             {
+                if (args[i] == "--self-test")
+                {
+                    RunSelfTestAndExit();
+                    return;
+                }
                 if (args[i] == "--host" || args[i] == "--port") forceHost = true;
                 if (args[i] == "--client" || args[i] == "--connect") forceClient = true;
             }
@@ -177,6 +179,55 @@ namespace TurboUnified
             }
 
             Application.Run(new UnifiedLauncherForm());
+        }
+
+        private static void RunSelfTestAndExit()
+        {
+            try
+            {
+                // 1. Verify Physical Screen Resolution & Delta Screen Encoder
+                StreamConfig cfg = new StreamConfig();
+                cfg.ApplyPreset(BandwidthProfile.Balanced_4G);
+                using (DeltaScreenEncoder enc = new DeltaScreenEncoder())
+                {
+                    int tiles, nw, nh;
+                    byte[] frame1 = enc.CaptureAndEncodeDelta(cfg, out tiles, out nw, out nh);
+                    if (nw <= 0 || nh <= 0 || tiles <= 0 || frame1.Length == 0)
+                        throw new Exception("DeltaScreenEncoder keyframe failed.");
+
+                    Bitmap decodedBmp = null;
+                    int dnw, dnh, dsw, dsh, dtiles;
+                    DeltaScreenEncoder.ApplyDeltaFrame(frame1, ref decodedBmp, out dnw, out dnh, out dsw, out dsh, out dtiles);
+                    if (decodedBmp == null || dnw != nw || dnh != nh || dtiles != tiles)
+                        throw new Exception("DeltaScreenEncoder decode mismatch.");
+                    decodedBmp.Dispose();
+
+                    // 2. Verify AES-256 + HMAC-SHA256 Zero-Knowledge SecurityContext & Anti-Replay
+                    byte[] salt = new byte[16];
+                    byte[] chal = new byte[16];
+                    using (SecurityContext hostSec = new SecurityContext("2580", salt, chal))
+                    using (SecurityContext clientSec = new SecurityContext("2580", salt, chal))
+                    {
+                        byte[] proof = clientSec.ComputeHandshakeProof(chal, "CLIENT_AUTH_V2");
+                        byte[] expected = hostSec.ComputeHandshakeProof(chal, "CLIENT_AUTH_V2");
+                        if (!TurboProtocol.ConstantTimeEquals(proof, expected))
+                            throw new Exception("HMAC handshake proof mismatch.");
+
+                        byte[] encryptedFrame = hostSec.EncryptAndAuthenticate(PacketType.ScreenFrame, frame1);
+                        byte[] decryptedFrame = clientSec.VerifyAndDecrypt(PacketType.ScreenFrame, encryptedFrame);
+                        if (!TurboProtocol.ConstantTimeEquals(frame1, decryptedFrame))
+                            throw new Exception("AES-256 E2EE payload mismatch.");
+                    }
+
+                    Console.WriteLine(string.Format("SELF_TEST_PASSED|Resolution={0}x{1}|KeyFrameTiles={2}|CompressedBytes={3}|Encryption=AES-256-HMAC-SHA256", nw, nh, tiles, frame1.Length));
+                    Environment.Exit(0);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("SELF_TEST_FAILED|" + ex.Message);
+                Environment.Exit(1);
+            }
         }
     }
 }

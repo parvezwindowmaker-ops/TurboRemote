@@ -41,9 +41,7 @@ namespace TurboCore
         SystemAction = 16,
         Ping = 17,
         Pong = 18,
-        ForceFullFrame = 19,
-        InputLockToggle = 20,
-        CursorPosSync = 22
+        ForceFullFrame = 19
     }
 
     public enum BandwidthProfile : byte
@@ -162,21 +160,15 @@ namespace TurboCore
             long seq = Interlocked.Increment(ref _sendSeq);
 
             byte[] iv = new byte[16];
-            using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+            lock (_rng)
             {
-                rng.GetBytes(iv);
+                _rng.GetBytes(iv);
             }
 
             byte[] cipherBytes;
-            using (Aes aes = Aes.Create())
+            lock (_aes)
             {
-                aes.KeySize = 256;
-                aes.Key = EncKey;
-                aes.IV = iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
-
-                using (ICryptoTransform enc = aes.CreateEncryptor())
+                using (ICryptoTransform enc = _aes.CreateEncryptor(EncKey, iv))
                 {
                     cipherBytes = enc.TransformFinalBlock(plainPayload, 0, plainPayload.Length);
                 }
@@ -244,15 +236,9 @@ namespace TurboCore
 
             Interlocked.Exchange(ref _recvSeq, seq);
 
-            using (Aes aes = Aes.Create())
+            lock (_aes)
             {
-                aes.KeySize = 256;
-                aes.Key = EncKey;
-                aes.IV = iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
-
-                using (ICryptoTransform dec = aes.CreateDecryptor())
+                using (ICryptoTransform dec = _aes.CreateDecryptor(EncKey, iv))
                 {
                     return dec.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
                 }
@@ -536,9 +522,6 @@ namespace TurboCore
         private const int DESKTOPHORZRES = 118;
         private const int DESKTOPVERTRES = 117;
 
-        [DllImport("user32.dll")]
-        private static extern int GetSystemMetrics(int nIndex);
-
         public static Rectangle GetPhysicalMonitorBounds(int monitorIndex)
         {
             System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
@@ -782,52 +765,6 @@ namespace TurboCore
             }
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct CURSORINFO
-        {
-            public int cbSize;
-            public int flags;
-            public IntPtr hCursor;
-            public POINT ptScreenPos;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct POINT
-        {
-            public int X;
-            public int Y;
-        }
-
-        [DllImport("user32.dll")]
-        private static extern bool GetCursorInfo(out CURSORINFO pci);
-
-        [DllImport("user32.dll")]
-        private static extern bool DrawIcon(IntPtr hDC, int X, int Y, IntPtr hIcon);
-
-        private const int CURSOR_SHOWING = 0x00000001;
-
-        private static void DrawCursorOverlay(Graphics g, int offsetX, int offsetY)
-        {
-            try
-            {
-                CURSORINFO pci;
-                pci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
-                if (GetCursorInfo(out pci) && (pci.flags & CURSOR_SHOWING) != 0)
-                {
-                    IntPtr hdc = g.GetHdc();
-                    try
-                    {
-                        DrawIcon(hdc, pci.ptScreenPos.X - offsetX, pci.ptScreenPos.Y - offsetY, pci.hCursor);
-                    }
-                    finally
-                    {
-                        g.ReleaseHdc(hdc);
-                    }
-                }
-            }
-            catch { }
-        }
-
         public void Dispose()
         {
             if (_encoderParams != null) _encoderParams.Dispose();
@@ -869,18 +806,6 @@ namespace TurboCore
 
         private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         private const uint KEYEVENTF_KEYUP = 0x0002;
-
-        [DllImport("user32.dll")]
-        private static extern bool SetProcessDPIAware();
-
-        [DllImport("shcore.dll")]
-        private static extern int SetProcessDpiAwareness(int value);
-
-        public static void EnableHighDpiAwareness()
-        {
-            // Keep Windows Forms at 96-DPI logical coordinates so pixel-positioned buttons/text never clip!
-            // Physical screen resolution is queried directly via gdi32 GetDeviceCaps(DESKTOPHORZRES/DESKTOPVERTRES).
-        }
 
         public static void PreventSystemSleep()
         {
@@ -1145,38 +1070,41 @@ namespace TurboCore
             }
         }
 
-        public static async Task<string> ResolveHostTicketFromCloudAsync(string roomCode, string pin)
+        public static Task<string> ResolveHostTicketFromCloudAsync(string roomCode, string pin)
         {
-            try
+            return Task.Run(() =>
             {
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                string url = DeriveRendezvousUrl(roomCode, pin) + "/raw?poll=1&since=12h";
-
-                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-                req.Method = "GET";
-                req.Timeout = 5000;
-                using (WebResponse resp = await req.GetResponseAsync())
-                using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                try
                 {
-                    string all = await sr.ReadToEndAsync();
-                    string[] lines = all.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                    // Read latest published ticket from bottom to top
-                    for (int i = lines.Length - 1; i >= 0; i--)
+                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                    string url = DeriveRendezvousUrl(roomCode, pin) + "/raw?poll=1&since=12h";
+
+                    HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                    req.Method = "GET";
+                    req.Timeout = 2000;
+                    req.ReadWriteTimeout = 2000;
+                    using (WebResponse resp = req.GetResponse())
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
                     {
-                        try
+                        string all = sr.ReadToEnd();
+                        string[] lines = all.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                        for (int i = lines.Length - 1; i >= 0; i--)
                         {
-                            string decrypted = DecryptTicketFromCloud(lines[i], pin);
-                            if (!string.IsNullOrWhiteSpace(decrypted))
+                            try
                             {
-                                return decrypted;
+                                string decrypted = DecryptTicketFromCloud(lines[i], pin);
+                                if (!string.IsNullOrWhiteSpace(decrypted))
+                                {
+                                    return decrypted;
+                                }
                             }
+                            catch { }
                         }
-                        catch { }
                     }
                 }
-            }
-            catch { }
-            return null;
+                catch { }
+                return (string)null;
+            });
         }
 
         public static List<string> GetRawHostIps()
@@ -1325,21 +1253,51 @@ namespace TurboCore
             return "Public Internet / WAN Tunnel";
         }
 
-        public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin = "2580")
+        public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin, CancellationToken ct)
         {
             string rawInput = hostInput != null ? hostInput.Trim() : "";
             List<EndpointCandidate> candidates = new List<EndpointCandidate>();
 
-            // 1. Always add direct parse of whatever the user typed (IP, Windows Machine Name like WM-DEV-07, or comma-separated list)
+            // 1. Add whatever user typed (IP, Windows Machine Name like WM-DEV-07, or comma-separated list)
             if (!string.IsNullOrEmpty(rawInput) && !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase))
             {
                 candidates.AddRange(ParseCandidates(rawInput.TrimStart('@'), defaultPort));
             }
 
-            // 2. Run UDP Local LAN Broadcast Discovery in parallel (300ms max)
+            // 2. If user typed a single IP or Hostname, try direct fast TCP connect FIRST (700ms fast path!)
+            // If the machine is on Local LAN or direct IP, this connects in 2-15ms without waiting for UDP or Cloud!
+            if (candidates.Count == 1)
+            {
+                EndpointCandidate primary = candidates[0];
+                try
+                {
+                    TcpClient fastTcp = new TcpClient();
+                    fastTcp.NoDelay = true;
+                    Task fastConnect = fastTcp.ConnectAsync(primary.Host, primary.Port);
+                    Task done = await Task.WhenAny(fastConnect, Task.Delay(700, ct));
+                    ct.ThrowIfCancellationRequested();
+                    if (done == fastConnect && fastTcp.Connected)
+                    {
+                        await fastConnect; // propagate any immediate error
+                        return new KeyValuePair<TcpClient, EndpointCandidate>(fastTcp, primary);
+                    }
+                    try { fastTcp.Close(); } catch { }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Fall through to UDP LAN broadcast + Cloud Rendezvous below
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // 3. Run UDP Local LAN Broadcast Discovery (300ms) + Cloud Rendezvous (1200ms) in parallel
             Task<List<EndpointCandidate>> lanTask = DiscoverLanHostsAsync(300);
 
-            // 3. If input is a Host ID / Machine Name (no dots), ALSO check Cloud Rendezvous in parallel with a strict 1.5s cap
             bool looksLikeHostId = !string.IsNullOrEmpty(rawInput) &&
                                    !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
                                    !rawInput.Contains(".") &&
@@ -1349,7 +1307,8 @@ namespace TurboCore
             {
                 string cleanRoom = rawInput.TrimStart('@');
                 Task<string> cloudTask = ResolveHostTicketFromCloudAsync(cleanRoom, pin);
-                Task completed = await Task.WhenAny(cloudTask, Task.Delay(1400));
+                Task completed = await Task.WhenAny(cloudTask, Task.Delay(1200, ct));
+                ct.ThrowIfCancellationRequested();
                 if (completed == cloudTask && !string.IsNullOrWhiteSpace(cloudTask.Result))
                 {
                     foreach (EndpointCandidate cc in ParseCandidates(cloudTask.Result, defaultPort))
@@ -1374,48 +1333,46 @@ namespace TurboCore
                 candidates.Add(new EndpointCandidate { Host = "127.0.0.1", Port = defaultPort, RouteLabel = "Localhost" });
             }
 
-            // 4. Race all candidates concurrently (Direct Hostname/LAN IP + Discovered LAN + Cloud WAN)
+            // 4. Race all candidates concurrently with strict 3.5s timeout and instant cancellation support
+            List<TcpClient> openedSockets = new List<TcpClient>();
             List<Task<KeyValuePair<TcpClient, EndpointCandidate>>> tasks = new List<Task<KeyValuePair<TcpClient, EndpointCandidate>>>();
             foreach (EndpointCandidate cand in candidates)
             {
                 EndpointCandidate c = cand;
+                TcpClient tcp = new TcpClient();
+                tcp.NoDelay = true;
+                openedSockets.Add(tcp);
+
                 tasks.Add(Task.Run(async () =>
                 {
-                    TcpClient tcp = new TcpClient();
-                    tcp.NoDelay = true;
                     await tcp.ConnectAsync(c.Host, c.Port);
                     return new KeyValuePair<TcpClient, EndpointCandidate>(tcp, c);
                 }));
             }
 
-            Task timeoutGuard = Task.Delay(4500);
+            Task timeoutGuard = Task.Delay(3500, ct);
             Exception lastErr = null;
             while (tasks.Count > 0)
             {
-                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = null;
                 List<Task> waitList = new List<Task>(tasks);
                 waitList.Add(timeoutGuard);
 
                 Task first = await Task.WhenAny(waitList);
                 if (first == timeoutGuard)
                 {
-                    throw new TimeoutException("Connection timed out reaching " + rawInput + ":" + defaultPort + " (Verify TurboRemote Host is running).");
+                    foreach (TcpClient s in openedSockets) { try { s.Close(); } catch { } }
+                    ct.ThrowIfCancellationRequested();
+                    throw new TimeoutException("Timed out connecting to " + rawInput + ":" + defaultPort + ". Make sure TurboRemote Host is running.");
                 }
 
-                finished = (Task<KeyValuePair<TcpClient, EndpointCandidate>>)first;
+                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = (Task<KeyValuePair<TcpClient, EndpointCandidate>>)first;
                 tasks.Remove(finished);
                 try
                 {
                     KeyValuePair<TcpClient, EndpointCandidate> winner = await finished;
-                    foreach (var remaining in tasks)
+                    foreach (TcpClient s in openedSockets)
                     {
-                        var _ = remaining.ContinueWith(t =>
-                        {
-                            if (t.Status == TaskStatus.RanToCompletion && t.Result.Key != null)
-                            {
-                                try { t.Result.Key.Close(); } catch { }
-                            }
-                        });
+                        if (s != winner.Key) { try { s.Close(); } catch { } }
                     }
                     return winner;
                 }
@@ -1425,6 +1382,7 @@ namespace TurboCore
                 }
             }
 
+            foreach (TcpClient s in openedSockets) { try { s.Close(); } catch { } }
             throw lastErr ?? new SocketException();
         }
     }
