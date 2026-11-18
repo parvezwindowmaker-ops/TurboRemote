@@ -22,16 +22,19 @@ You do **not** need to install Python, .NET Core, or any third-party libraries. 
 
 ## 🖥 2. Setting Up the Host PC (`SHARE THIS PC`)
 
-Once you click **🖥 SHARE THIS PC (Start Host Server)**:
+Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both **Local LAN** and **Internet** starts **automatically by default**:
 
-1. **Server Auto-Starts on Port `9876`**:
-   - The server immediately starts listening on TCP port `9876` (and UDP LAN Discovery port `9878`).
+1. **Auto-Starts Local + Internet Access Immediately**:
+   - Opens TCP port `9876` and UDP LAN Discovery port `9878`.
+   - **Automatically opens Windows Firewall** (when running as Admin).
+   - **Automatically maps UPnP on your router** for port `9876`.
+   - **Automatically starts and maintains the Public Internet Tunnel** (`tcp://xxxx.pinggy.io:PORT`) in the background with an auto-reconnect watchdog if the tunnel ever drops.
+   - **Automatically publishes and refreshes your encrypted endpoints** under your **Host ID** every 4 minutes so you can connect from anywhere on the Internet at any time.
 2. **Set or Generate Your Access Key / PIN**:
    - The default PIN is **`2580`**.
    - Click the **`🎲`** button next to the PIN box to generate a random cryptographic Access Key (e.g., `K9X4-M7P2`).
 3. **Grant Full Administrator Permissions (Recommended)**:
    - Click **`🛡 Elevate to Admin (UAC)`** so you can remotely control elevated windows, Task Manager, UAC prompts, and lock the remote keyboard/mouse.
-   - Click **`🔓 Open Windows Firewall`** once (after elevating) so Windows Firewall allows incoming connections on port `9876`.
 4. **Optional — Auto-Start When Windows Boots**:
    - Click **`⚙ Install Unattended Admin Startup Task`** (while elevated as Admin) to register a Windows Scheduled Task (`/RL HIGHEST`) that automatically starts `TurboRemote.exe` in Host mode whenever Windows logs in.
 

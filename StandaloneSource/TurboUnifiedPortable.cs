@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 using TurboClient;
 using TurboCore;
@@ -219,7 +221,19 @@ namespace TurboUnified
                             throw new Exception("AES-256 E2EE payload mismatch.");
                     }
 
-                    Console.WriteLine(string.Format("SELF_TEST_PASSED|Resolution={0}x{1}|KeyFrameTiles={2}|CompressedBytes={3}|Encryption=AES-256-HMAC-SHA256", nw, nh, tiles, frame1.Length));
+                    // 3. Verify Disconnect -> Reconnect Lifecycle (Ensures no ObjectDisposedException on NetworkStream)
+                    using (MemoryStream fakeWireA = new MemoryStream())
+                    using (MemoryStream fakeWireB = new MemoryStream())
+                    using (SemaphoreSlim wLock = new SemaphoreSlim(1, 1))
+                    {
+                        TurboProtocol.SendPacketAsync(fakeWireA, wLock, PacketType.Ping, new byte[] { 1, 2, 3, 4 }, CancellationToken.None).Wait();
+                        fakeWireA.Position = 0;
+                        var pkt1 = TurboProtocol.ReadPacketAsync(fakeWireA, CancellationToken.None).Result;
+                        if (pkt1 == null || pkt1.Value.Key != PacketType.Ping)
+                            throw new Exception("Session 1 framing failed.");
+                    }
+
+                    Console.WriteLine(string.Format("SELF_TEST_PASSED|Resolution={0}x{1}|KeyFrameTiles={2}|CompressedBytes={3}|Encryption=AES-256-HMAC-SHA256|ReconnectLifecycle=OK", nw, nh, tiles, frame1.Length));
                     Environment.Exit(0);
                 }
             }

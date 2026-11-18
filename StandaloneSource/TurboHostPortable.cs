@@ -733,10 +733,12 @@ namespace TurboHost
 
         private async Task PublishTicketToCloudDirectoryAsync()
         {
+            string portStr = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim())) : _txtPort.Text.Trim();
+            string room = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtRoomId.Text.Trim())) : _txtRoomId.Text.Trim();
+            string pin = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPin.Text.Trim())) : _txtPin.Text.Trim();
+
             int port = 9876;
-            int.TryParse(_txtPort.Text.Trim(), out port);
-            string room = _txtRoomId.Text.Trim();
-            string pin = _txtPin.Text.Trim();
+            int.TryParse(portStr, out port);
             string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
 
             Log(string.Format("[Cloud Discovery] Publishing AES-256 encrypted endpoints for Host ID '{0}'...", room));
@@ -757,16 +759,18 @@ namespace TurboHost
             {
                 if (_tunnelProc != null && !_tunnelProc.HasExited)
                 {
-                    Log("[Tunnel] Public tunnel process is already running.");
                     return;
                 }
 
-                string port = _txtPort.Text.Trim();
-                Log("[Tunnel] Starting background OpenSSH Public Internet TCP Relay for local port " + port + "...");
+                string port = InvokeRequired
+                    ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim()))
+                    : _txtPort.Text.Trim();
+
+                Log("[Auto-Tunnel] Starting background OpenSSH Public Internet TCP Relay for local port " + port + "...");
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = "ssh.exe",
-                    Arguments = string.Format("-p 443 -R0:localhost:{0} -o StrictHostKeyChecking=no -o ServerAliveInterval=30 tcp@a.pinggy.io", port),
+                    Arguments = string.Format("-p 443 -R0:localhost:{0} -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ServerAliveInterval=20 -o ExitOnForwardFailure=yes tcp@a.pinggy.io", port),
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -775,13 +779,28 @@ namespace TurboHost
                 _tunnelProc = new Process { StartInfo = psi, EnableRaisingEvents = true };
                 _tunnelProc.OutputDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
                 _tunnelProc.ErrorDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
+                _tunnelProc.Exited += (s, e) =>
+                {
+                    if (_isRunning && _serverCts != null && !_serverCts.Token.IsCancellationRequested)
+                    {
+                        Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await Task.Delay(5000, _serverCts.Token);
+                                if (_isRunning) StartBuiltInPublicSshTunnel();
+                            }
+                            catch { }
+                        });
+                    }
+                };
                 _tunnelProc.Start();
                 _tunnelProc.BeginOutputReadLine();
                 _tunnelProc.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
-                Log("[Tunnel Error] " + ex.Message);
+                Log("[Auto-Tunnel] Background SSH tunnel note: " + ex.Message);
             }
         }
 
@@ -857,6 +876,45 @@ namespace TurboHost
             else await StartServerAsync();
         }
 
+        private async Task AutoOpenFirewallUpnpAndTunnelAsync(int port)
+        {
+            // 1. Automatically open Windows Firewall inbound rule (if running as Admin)
+            if (NativeInputInjector.IsRunningAsAdmin())
+            {
+                bool fwOk = NetworkHelper.EnsureFirewallRule("TurboRemote_Host_TCP", port);
+                NetworkHelper.EnsureFirewallRule("TurboRemote_Host_UDP", SmartRouteEngine.DiscoveryUdpPort);
+                if (fwOk)
+                {
+                    Log("[Auto-Port] Windows Firewall opened automatically for TCP port " + port + " & UDP " + SmartRouteEngine.DiscoveryUdpPort + ".");
+                }
+            }
+
+            // 2. Automatically probe UPnP Router Gateway to open external port
+            try
+            {
+                string upnpMsg = await NetworkHelper.TryUpnpPortForwardAsync(port, port);
+                Log("[Auto-UPnP] " + upnpMsg);
+            }
+            catch { }
+
+            // 3. Automatically start & maintain Public Internet Tunnel (with auto-reconnect watchdog)
+            StartBuiltInPublicSshTunnel();
+
+            // 4. Periodically refresh Cloud Rendezvous ticket every 4 minutes so Internet clients can always find this Host
+            while (_isRunning && _serverCts != null && !_serverCts.Token.IsCancellationRequested)
+            {
+                await PublishTicketToCloudDirectoryAsync();
+                try
+                {
+                    await Task.Delay(240000, _serverCts.Token);
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        }
+
         private async Task StartServerAsync()
         {
             if (_isRunning) return;
@@ -880,11 +938,13 @@ namespace TurboHost
                 _isRunning = true;
                 _btnStartStop.Text = "⏹ Stop Host Server";
                 _btnStartStop.BackColor = Color.FromArgb(185, 55, 55);
-                _lblStatus.Text = "● Server Status: LISTENING ON PORT " + port;
+                _lblStatus.Text = "● Server Status: LISTENING ON PORT " + port + " (LOCAL + INTERNET ACTIVE)";
                 _lblStatus.ForeColor = Color.FromArgb(95, 245, 155);
 
                 Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, PIN: {2})", port, _txtRoomId.Text, _txtPin.Text));
-                Task.Run(() => PublishTicketToCloudDirectoryAsync());
+
+                // Automatically open Firewall, map UPnP router port, launch Public Internet Tunnel, and publish to Cloud
+                Task.Run(() => AutoOpenFirewallUpnpAndTunnelAsync(port));
 
                 while (!_serverCts.Token.IsCancellationRequested)
                 {
@@ -909,6 +969,10 @@ namespace TurboHost
                 _isRunning = false;
                 if (_serverCts != null) _serverCts.Cancel();
                 if (_listener != null) _listener.Stop();
+                if (_tunnelProc != null && !_tunnelProc.HasExited)
+                {
+                    try { _tunnelProc.Kill(); } catch { }
+                }
             }
             catch { }
 
@@ -916,7 +980,7 @@ namespace TurboHost
             _btnStartStop.BackColor = Color.FromArgb(34, 155, 95);
             _lblStatus.Text = "● Server Status: STOPPED";
             _lblStatus.ForeColor = Color.FromArgb(255, 180, 90);
-            Log("[Server] Listener stopped.");
+            Log("[Server] Listener and Internet tunnel stopped.");
         }
 
         private async Task ConnectReverseToClientAsync()

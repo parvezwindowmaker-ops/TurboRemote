@@ -426,6 +426,9 @@ namespace TurboClient
 
         private async Task ConnectToHostAsync()
         {
+            // Cleanly tear down any previous session before opening a new one
+            Disconnect();
+
             string hostInput = _txtHostIp.Text.Trim();
             int port;
             if (!int.TryParse(_txtPort.Text.Trim(), out port))
@@ -436,6 +439,7 @@ namespace TurboClient
 
             _isConnecting = true;
             _connectCts = new CancellationTokenSource();
+            CancellationToken myConnectToken = _connectCts.Token;
             _btnConnect.Text = "✖ Stop / Cancel";
             _btnConnect.BackColor = Color.FromArgb(195, 110, 30);
             _btnConnect.Enabled = true;
@@ -445,16 +449,32 @@ namespace TurboClient
                 _lblTelemetry.Text = "● CONNECTING TO " + hostInput + " (Click '✖ Stop / Cancel' to abort)...";
                 _lblTelemetry.ForeColor = Color.FromArgb(110, 220, 255);
 
-                KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(hostInput, port, _txtPin.Text.Trim(), _connectCts.Token);
+                KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(hostInput, port, _txtPin.Text.Trim(), myConnectToken);
+                myConnectToken.ThrowIfCancellationRequested();
+
                 TcpClient client = winner.Key;
                 EndpointCandidate route = winner.Value;
 
-                await InitializeActiveSessionAsync(client, route);
+                await InitializeActiveSessionAsync(client, route, myConnectToken);
             }
             catch (OperationCanceledException)
             {
                 _lblTelemetry.Text = "● CONNECTION CANCELLED BY USER.";
                 _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
+                ResetConnectButton();
+            }
+            catch (ObjectDisposedException)
+            {
+                if (myConnectToken.IsCancellationRequested)
+                {
+                    _lblTelemetry.Text = "● CONNECTION CANCELLED BY USER.";
+                    _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
+                }
+                else
+                {
+                    _lblTelemetry.Text = "● CONNECTION FAILED: Remote Host closed or reset the socket (Ensure latest TurboRemote.exe is running on Host).";
+                    _lblTelemetry.ForeColor = Color.FromArgb(255, 110, 110);
+                }
                 ResetConnectButton();
             }
             catch (Exception ex)
@@ -504,7 +524,7 @@ namespace TurboClient
                     Host = client.Client.RemoteEndPoint.ToString(),
                     Port = 9877,
                     RouteLabel = "Reverse Outbound WAN"
-                });
+                }, CancellationToken.None);
             }
             catch (Exception ex)
             {
@@ -512,14 +532,14 @@ namespace TurboClient
             }
         }
 
-        private async Task InitializeActiveSessionAsync(TcpClient client, EndpointCandidate winningRoute)
+        private async Task InitializeActiveSessionAsync(TcpClient client, EndpointCandidate winningRoute, CancellationToken connectCt)
         {
             _tcpClient = client;
             _tcpClient.NoDelay = true;
             _tcpClient.ReceiveBufferSize = 256 * 1024;
             _tcpClient.SendBufferSize = 256 * 1024;
             _stream = _tcpClient.GetStream();
-            _sessionCts = new CancellationTokenSource();
+            _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(connectCt);
 
             // 1. Read 32B Cryptographic Challenge (16B Salt + 16B Nonce) from Host
             KeyValuePair<PacketType, byte[]>? challengePkt = await TurboProtocol.ReadPacketAsync(_stream, _sessionCts.Token);
@@ -577,7 +597,10 @@ namespace TurboClient
             await SendStreamConfigAsync();
             await RequestRemoteFileListAsync("DEFAULT");
 
-            Task.Run(() => ReceivePacketsLoopAsync(_sessionCts.Token));
+            NetworkStream activeStream = _stream;
+            SecurityContext activeSec = _sec;
+            CancellationToken activeToken = _sessionCts.Token;
+            Task.Run(() => ReceivePacketsLoopAsync(activeStream, activeSec, activeToken));
         }
 
         private void Disconnect()
@@ -586,23 +609,31 @@ namespace TurboClient
             _isConnecting = false;
             try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
-            try { if (_stream != null) _stream.Dispose(); } catch { }
-            try { if (_tcpClient != null) _tcpClient.Close(); } catch { }
-            try { if (_downloadingStream != null) _downloadingStream.Dispose(); } catch { }
-            try { if (_sec != null) { _sec.Dispose(); _sec = null; } } catch { }
+
+            NetworkStream oldStream = _stream;
+            TcpClient oldClient = _tcpClient;
+            SecurityContext oldSec = _sec;
+            _stream = null;
+            _tcpClient = null;
+            _sec = null;
+
+            try { if (oldStream != null) oldStream.Dispose(); } catch { }
+            try { if (oldClient != null) oldClient.Close(); } catch { }
+            try { if (_downloadingStream != null) { _downloadingStream.Dispose(); _downloadingStream = null; } } catch { }
+            try { if (oldSec != null) oldSec.Dispose(); } catch { }
 
             ResetConnectButton();
             _lblTelemetry.Text = "● DISCONNECTED";
             _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
         }
 
-        private async Task ReceivePacketsLoopAsync(CancellationToken ct)
+        private async Task ReceivePacketsLoopAsync(NetworkStream sessionStream, SecurityContext sessionSec, CancellationToken ct)
         {
             try
             {
                 while (!ct.IsCancellationRequested && _isConnected)
                 {
-                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(_stream, ct, _sec);
+                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(sessionStream, ct, sessionSec);
                     if (pkt == null) break;
 
                     PacketType type = pkt.Value.Key;
@@ -659,7 +690,7 @@ namespace TurboClient
             catch { }
             finally
             {
-                if (!IsDisposed)
+                if (!IsDisposed && _stream == sessionStream)
                 {
                     BeginInvoke(new Action(Disconnect));
                 }

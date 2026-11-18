@@ -1276,10 +1276,13 @@ namespace TurboCore
                     Task fastConnect = fastTcp.ConnectAsync(primary.Host, primary.Port);
                     Task done = await Task.WhenAny(fastConnect, Task.Delay(700, ct));
                     ct.ThrowIfCancellationRequested();
-                    if (done == fastConnect && fastTcp.Connected)
+                    if (done == fastConnect)
                     {
-                        await fastConnect; // propagate any immediate error
-                        return new KeyValuePair<TcpClient, EndpointCandidate>(fastTcp, primary);
+                        await fastConnect; // throws if refused/unreachable
+                        if (fastTcp.Connected)
+                        {
+                            return new KeyValuePair<TcpClient, EndpointCandidate>(fastTcp, primary);
+                        }
                     }
                     try { fastTcp.Close(); } catch { }
                 }
@@ -1372,7 +1375,10 @@ namespace TurboCore
                     KeyValuePair<TcpClient, EndpointCandidate> winner = await finished;
                     foreach (TcpClient s in openedSockets)
                     {
-                        if (s != winner.Key) { try { s.Close(); } catch { } }
+                        if (!object.ReferenceEquals(s, winner.Key))
+                        {
+                            try { s.Close(); } catch { }
+                        }
                     }
                     return winner;
                 }
