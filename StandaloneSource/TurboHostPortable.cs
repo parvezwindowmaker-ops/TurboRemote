@@ -26,6 +26,7 @@ namespace TurboHost
 
         private readonly StreamConfig _config = new StreamConfig();
         private readonly DeltaScreenEncoder _encoder = new DeltaScreenEncoder();
+        private readonly AutoResetEvent _urgentTrigger = new AutoResetEvent(false);
 
         private FileStream _incomingFileStream;
         private string _incomingFilePath;
@@ -45,7 +46,7 @@ namespace TurboHost
             _sec = sec;
             _log = log;
             _reportBytes = reportBytes;
-            _config.ApplyPreset(BandwidthProfile.Balanced_4G);
+            _config.ApplyPreset(BandwidthProfile.AutoAdaptive);
         }
 
         public async Task RunAsync(CancellationToken parentCt)
@@ -60,6 +61,7 @@ namespace TurboHost
                 sessionCts.Cancel();
                 try { NativeInputInjector.BlockInput(false); } catch { }
                 if (_incomingFileStream != null) _incomingFileStream.Dispose();
+                _urgentTrigger.Dispose();
                 _encoder.Dispose();
             }
         }
@@ -77,29 +79,41 @@ namespace TurboHost
                 {
                     if (_config.Profile == BandwidthProfile.AutoAdaptive)
                     {
-                        if (_lastFrameSendDurationMs > 170)
+                        if (_lastFrameSendDurationMs > 160)
                         {
-                            _config.Scale = 0.38f;
-                            _config.JpegQuality = 18;
+                            // Extreme low-bandwidth 2G fallback
+                            _config.Scale = 0.42f;
+                            _config.JpegQuality = 20;
                             _config.Grayscale = true;
                             _config.LowBitPosterize = true;
-                            _config.TargetFps = 10;
+                            _config.TargetFps = 20;
                         }
-                        else if (_lastFrameSendDurationMs > 70)
+                        else if (_lastFrameSendDurationMs > 60)
                         {
-                            _config.Scale = 0.55f;
-                            _config.JpegQuality = 34;
+                            // Moderate 3G / WAN
+                            _config.Scale = 0.60f;
+                            _config.JpegQuality = 38;
                             _config.Grayscale = false;
                             _config.LowBitPosterize = false;
-                            _config.TargetFps = 16;
+                            _config.TargetFps = 30;
                         }
-                        else
+                        else if (_lastFrameSendDurationMs > 15)
                         {
-                            _config.Scale = 0.78f;
+                            // Standard 4G / Fast WAN
+                            _config.Scale = 0.80f;
                             _config.JpegQuality = 55;
                             _config.Grayscale = false;
                             _config.LowBitPosterize = false;
-                            _config.TargetFps = 25;
+                            _config.TargetFps = 45;
+                        }
+                        else
+                        {
+                            // Ultra-fast Local LAN / P2P (<15ms send) -> 60 FPS Native Quality!
+                            _config.Scale = 1.0f;
+                            _config.JpegQuality = 75;
+                            _config.Grayscale = false;
+                            _config.LowBitPosterize = false;
+                            _config.TargetFps = 60;
                         }
                     }
 
@@ -127,10 +141,11 @@ namespace TurboHost
                     break;
                 }
 
-                int targetIntervalMs = Math.Max(20, 1000 / Math.Max(4, _config.TargetFps));
+                int targetIntervalMs = Math.Max(14, 1000 / Math.Max(10, _config.TargetFps));
                 int elapsed = (int)(sw.ElapsedMilliseconds - frameStart);
-                int delay = Math.Max(5, targetIntervalMs - elapsed);
-                await Task.Delay(delay, ct);
+                int delay = Math.Max(2, targetIntervalMs - elapsed);
+                // Wait for next frame timer OR wake up IMMEDIATELY when user clicks/types!
+                _urgentTrigger.WaitOne(delay);
             }
         }
 
@@ -197,6 +212,11 @@ namespace TurboHost
             float normY = BitConverter.ToSingle(data, 5);
             int wheel = BitConverter.ToInt32(data, 9);
             NativeInputInjector.InjectMouse(action, normX, normY, wheel, _config.MonitorIndex);
+            // If user clicked or scrolled, wake up the screen encoder immediately for 0-ms visual response!
+            if (action != MouseActionType.Move)
+            {
+                _urgentTrigger.Set();
+            }
         }
 
         private void HandleKeyInput(byte[] data)
@@ -205,6 +225,7 @@ namespace TurboHost
             ushort vk = BitConverter.ToUInt16(data, 0);
             bool isDown = data[2] == 1;
             NativeInputInjector.InjectKey(vk, isDown);
+            _urgentTrigger.Set();
         }
 
         private void HandleConfigUpdate(byte[] data)

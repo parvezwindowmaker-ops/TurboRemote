@@ -42,16 +42,17 @@ namespace TurboCore
         Ping = 17,
         Pong = 18,
         ForceFullFrame = 19,
-        InputLockToggle = 20
+        InputLockToggle = 20,
+        CursorPosSync = 22
     }
 
     public enum BandwidthProfile : byte
     {
-        UltraLow_2G = 0,     // 38% scale, Grayscale + 16-Level Posterized, JPEG Q=18, 10 FPS (~8-20 KB/s)
-        Low_3G = 1,          // 52% scale, Color JPEG Q=32, 15 FPS
-        Balanced_4G = 2,     // 75% scale, Color JPEG Q=50, 24 FPS
-        Turbo_Broadband = 3, // 100% scale, Color JPEG Q=78, 35 FPS
-        AutoAdaptive = 4     // Automatically shifts scale, color, and FPS based on real-time socket latency
+        UltraLow_2G = 0,     // 42% scale, Grayscale + 16-Level Posterized, JPEG Q=20, 22 FPS (~10-24 KB/s)
+        Low_3G = 1,          // 55% scale, Color JPEG Q=35, 32 FPS
+        Balanced_4G = 2,     // 75% scale, Color JPEG Q=52, 45 FPS
+        Turbo_Broadband = 3, // 100% scale, Color JPEG Q=78, 60 FPS
+        AutoAdaptive = 4     // Automatically shifts up to 60 FPS on fast/LAN links and scales down on slow WAN
     }
 
     public enum MouseActionType : byte
@@ -82,32 +83,32 @@ namespace TurboCore
             switch (profile)
             {
                 case BandwidthProfile.UltraLow_2G:
-                    Scale = 0.38f;
-                    JpegQuality = 18;
+                    Scale = 0.42f;
+                    JpegQuality = 20;
                     Grayscale = true;
                     LowBitPosterize = true;
-                    TargetFps = 10;
+                    TargetFps = 22;
                     break;
                 case BandwidthProfile.Low_3G:
-                    Scale = 0.52f;
-                    JpegQuality = 32;
+                    Scale = 0.55f;
+                    JpegQuality = 35;
                     Grayscale = false;
                     LowBitPosterize = false;
-                    TargetFps = 15;
+                    TargetFps = 32;
                     break;
                 case BandwidthProfile.Balanced_4G:
                     Scale = 0.75f;
-                    JpegQuality = 50;
+                    JpegQuality = 52;
                     Grayscale = false;
                     LowBitPosterize = false;
-                    TargetFps = 24;
+                    TargetFps = 45;
                     break;
                 case BandwidthProfile.Turbo_Broadband:
                     Scale = 1.0f;
                     JpegQuality = 78;
                     Grayscale = false;
                     LowBitPosterize = false;
-                    TargetFps = 35;
+                    TargetFps = 60;
                     break;
             }
         }
@@ -120,9 +121,11 @@ namespace TurboCore
         private long _sendSeq = 0;
         private long _recvSeq = 0;
 
+        private readonly Aes _aes;
+        private readonly RandomNumberGenerator _rng;
+
         public SecurityContext(string secretPinOrPassword, byte[] salt16, byte[] challenge16)
         {
-            // Derive 512 bits (32B AES-256 Key + 32B HMAC-SHA256 Key) via PBKDF2-SHA256
             byte[] combinedSalt = new byte[salt16.Length + challenge16.Length];
             Buffer.BlockCopy(salt16, 0, combinedSalt, 0, salt16.Length);
             Buffer.BlockCopy(challenge16, 0, combinedSalt, salt16.Length, challenge16.Length);
@@ -132,6 +135,13 @@ namespace TurboCore
                 EncKey = kdf.GetBytes(32);
                 MacKey = kdf.GetBytes(32);
             }
+
+            _aes = Aes.Create();
+            _aes.KeySize = 256;
+            _aes.Key = EncKey;
+            _aes.Mode = CipherMode.CBC;
+            _aes.Padding = PaddingMode.PKCS7;
+            _rng = RandomNumberGenerator.Create();
         }
 
         public byte[] ComputeHandshakeProof(byte[] challenge16, string roleTag)
@@ -251,6 +261,8 @@ namespace TurboCore
 
         public void Dispose()
         {
+            if (_aes != null) _aes.Dispose();
+            if (_rng != null) _rng.Dispose();
             if (EncKey != null) Array.Clear(EncKey, 0, EncKey.Length);
             if (MacKey != null) Array.Clear(MacKey, 0, MacKey.Length);
         }
@@ -512,6 +524,52 @@ namespace TurboCore
             }
         }
 
+        [DllImport("gdi32.dll")]
+        private static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDC(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        private const int DESKTOPHORZRES = 118;
+        private const int DESKTOPVERTRES = 117;
+
+        public static Rectangle GetPhysicalMonitorBounds(int monitorIndex)
+        {
+            System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
+            if (screens.Length == 0) return new Rectangle(0, 0, 1920, 1080);
+
+            int monIdx = monitorIndex;
+            if (monIdx < 0) monIdx = 0;
+            if (monIdx >= screens.Length) monIdx = screens.Length - 1;
+
+            Rectangle logical = screens[monIdx].Bounds;
+
+            // Also query physical desktop resolution in case DPI virtualization is active
+            if (monIdx == 0)
+            {
+                try
+                {
+                    IntPtr hdc = GetDC(IntPtr.Zero);
+                    if (hdc != IntPtr.Zero)
+                    {
+                        int physW = GetDeviceCaps(hdc, DESKTOPHORZRES);
+                        int physH = GetDeviceCaps(hdc, DESKTOPVERTRES);
+                        ReleaseDC(IntPtr.Zero, hdc);
+                        if (physW > logical.Width && physH > logical.Height)
+                        {
+                            return new Rectangle(logical.X, logical.Y, physW, physH);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return logical;
+        }
+
         public unsafe byte[] CaptureAndEncodeDelta(StreamConfig config, out int changedTilesCount, out int nativeWidth, out int nativeHeight)
         {
             changedTilesCount = 0;
@@ -527,7 +585,7 @@ namespace TurboCore
             if (monIdx < 0) monIdx = 0;
             if (monIdx >= screens.Length) monIdx = screens.Length - 1;
 
-            Rectangle bounds = screens[monIdx].Bounds;
+            Rectangle bounds = GetPhysicalMonitorBounds(monIdx);
             nativeWidth = bounds.Width;
             nativeHeight = bounds.Height;
 
@@ -550,7 +608,6 @@ namespace TurboCore
             EnsureBuffers(nativeWidth, nativeHeight, scaledW, scaledH);
 
             _rawCaptureGfx.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
-            DrawCursorOverlay(_rawCaptureGfx, bounds.X, bounds.Y);
             _scaledGfx.DrawImage(_rawCaptureBmp, 0, 0, scaledW, scaledH);
 
             int tileW = scaledW / GridCols;
@@ -559,6 +616,7 @@ namespace TurboCore
             BitmapData bmpData = _scaledBmp.LockBits(new Rectangle(0, 0, scaledW, scaledH), ImageLockMode.ReadWrite, PixelFormat.Format24bppRgb);
             ulong[,] newHashes = new ulong[GridCols, GridRows];
             bool[,] isDirty = new bool[GridCols, GridRows];
+            List<TilePatch> dirtyPatches = new List<TilePatch>(GridCols * GridRows);
 
             try
             {
@@ -620,6 +678,21 @@ namespace TurboCore
                         if (forceFull || _prevTileHashes[gx, gy] != hash)
                         {
                             isDirty[gx, gy] = true;
+                            byte* tilePtr = basePtr + (startY * stride) + (startX * 3);
+                            using (Bitmap zeroCopyTile = new Bitmap(w, h, stride, PixelFormat.Format24bppRgb, (IntPtr)tilePtr))
+                            using (MemoryStream tileMs = new MemoryStream(4096))
+                            {
+                                zeroCopyTile.Save(tileMs, _jpegEncoder, _encoderParams);
+                                dirtyPatches.Add(new TilePatch
+                                {
+                                    GridX = (ushort)startX,
+                                    GridY = (ushort)startY,
+                                    Width = (ushort)w,
+                                    Height = (ushort)h,
+                                    JpegBytes = tileMs.ToArray()
+                                });
+                            }
+                            _prevTileHashes[gx, gy] = hash;
                         }
                     }
                 }
@@ -627,36 +700,6 @@ namespace TurboCore
             finally
             {
                 _scaledBmp.UnlockBits(bmpData);
-            }
-
-            List<TilePatch> dirtyPatches = new List<TilePatch>(GridCols * GridRows);
-            for (int gy = 0; gy < GridRows; gy++)
-            {
-                int startY = gy * tileH;
-                int h = (gy == GridRows - 1) ? (scaledH - startY) : tileH;
-
-                for (int gx = 0; gx < GridCols; gx++)
-                {
-                    if (!isDirty[gx, gy]) continue;
-
-                    int startX = gx * tileW;
-                    int w = (gx == GridCols - 1) ? (scaledW - startX) : tileW;
-
-                    using (Bitmap tileBmp = _scaledBmp.Clone(new Rectangle(startX, startY, w, h), PixelFormat.Format24bppRgb))
-                    using (MemoryStream tileMs = new MemoryStream(4096))
-                    {
-                        tileBmp.Save(tileMs, _jpegEncoder, _encoderParams);
-                        dirtyPatches.Add(new TilePatch
-                        {
-                            GridX = (ushort)startX,
-                            GridY = (ushort)startY,
-                            Width = (ushort)w,
-                            Height = (ushort)h,
-                            JpegBytes = tileMs.ToArray()
-                        });
-                    }
-                    _prevTileHashes[gx, gy] = newHashes[gx, gy];
-                }
             }
 
             changedTilesCount = dirtyPatches.Count;
@@ -819,6 +862,25 @@ namespace TurboCore
         private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         private const uint KEYEVENTF_KEYUP = 0x0002;
 
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        [DllImport("shcore.dll")]
+        private static extern int SetProcessDpiAwareness(int value);
+
+        public static void EnableHighDpiAwareness()
+        {
+            try
+            {
+                // PROCESS_PER_MONITOR_DPI_AWARE = 2
+                SetProcessDpiAwareness(2);
+            }
+            catch
+            {
+                try { SetProcessDPIAware(); } catch { }
+            }
+        }
+
         public static void PreventSystemSleep()
         {
             try
@@ -894,13 +956,7 @@ namespace TurboCore
         {
             try
             {
-                System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
-                if (screens.Length == 0) return;
-
-                int idx = monitorIndex;
-                if (idx < 0) idx = 0;
-                if (idx >= screens.Length) idx = screens.Length - 1;
-                Rectangle bounds = screens[idx].Bounds;
+                Rectangle bounds = DeltaScreenEncoder.GetPhysicalMonitorBounds(monitorIndex);
 
                 if (normX < 0f) normX = 0f;
                 if (normX > 1f) normX = 1f;

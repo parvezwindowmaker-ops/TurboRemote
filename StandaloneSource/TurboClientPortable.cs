@@ -148,11 +148,11 @@ namespace TurboClient
             };
             _cmbBandwidth.Items.AddRange(new object[]
             {
-                "0: Ultra-Low 2G (38% Gray Q18)",
-                "1: Low 3G / Weak Wi-Fi (52% Q32)",
-                "2: Balanced 4G / WAN (75% Q50)",
-                "3: Turbo Broadband (100% Q78)",
-                "4: Auto-Adaptive Smart Speed"
+                "0: Ultra-Low 2G (42% Gray 22 FPS)",
+                "1: Low 3G / Weak Wi-Fi (55% 32 FPS)",
+                "2: Balanced 4G / WAN (75% 45 FPS)",
+                "3: Turbo LAN / Broadband (100% 60 FPS)",
+                "4: Auto-Adaptive Smart (20-60 FPS)"
             });
             _cmbBandwidth.SelectedIndex = 4; // Default to Auto-Adaptive Smart Speed
             _cmbBandwidth.SelectedIndexChanged += async (s, e) => await SendStreamConfigAsync();
@@ -242,7 +242,7 @@ namespace TurboClient
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.FromArgb(10, 12, 16),
-                Cursor = Cursors.Cross
+                Cursor = Cursors.Default
             };
             _screenCanvas.Paint += OnScreenCanvasPaint;
             _screenCanvas.MouseMove += OnCanvasMouseMove;
@@ -688,7 +688,7 @@ namespace TurboClient
         {
             if (!_isConnected) return;
             long now = Environment.TickCount;
-            if (now - _lastMouseMoveSentTick < 22) return;
+            if (now - _lastMouseMoveSentTick < 8) return; // 120 Hz ultra-responsive cursor tracking
             _lastMouseMoveSentTick = now;
 
             float nx, ny;

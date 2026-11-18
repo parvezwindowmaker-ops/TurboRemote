@@ -108,6 +108,7 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
+            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             HostMainForm form = new HostMainForm();
@@ -121,6 +122,7 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
+            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             ClientMainForm form = new ClientMainForm();
@@ -150,6 +152,7 @@ namespace TurboUnified
         [STAThread]
         public static void Main(string[] args)
         {
+            NativeInputInjector.EnableHighDpiAwareness();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
