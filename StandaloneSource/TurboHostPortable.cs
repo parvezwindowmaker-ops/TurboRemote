@@ -23,14 +23,20 @@ namespace TurboHost
         private readonly SecurityContext _sec;
         private readonly Action<string> _log;
         private readonly Action<int, double> _reportBytes;
+        private readonly Func<string> _getElevatedRestartArgs;
 
         private readonly StreamConfig _config = new StreamConfig();
         private readonly DeltaScreenEncoder _encoder = new DeltaScreenEncoder();
         private readonly AutoResetEvent _urgentTrigger = new AutoResetEvent(false);
+        private readonly SemaphoreSlim _downloadLock = new SemaphoreSlim(1, 1);
 
         private FileStream _incomingFileStream;
         private string _incomingFilePath;
-        private long _lastFrameSendDurationMs = 5;
+        private volatile bool _forceGrayscale;
+
+        // Auto-Adaptive quality: 0 = 2G, 1 = 3G/WAN, 2 = 4G/fast WAN, 3 = LAN. Only the screen loop touches these.
+        private int _adaptiveLevel = 3;
+        private long _adaptiveHoldStartMs;
 
         public ClientSessionHandler(
             TcpClient client,
@@ -38,7 +44,8 @@ namespace TurboHost
             SemaphoreSlim writeLock,
             SecurityContext sec,
             Action<string> log,
-            Action<int, double> reportBytes)
+            Action<int, double> reportBytes,
+            Func<string> getElevatedRestartArgs = null)
         {
             _client = client;
             _stream = stream;
@@ -46,6 +53,7 @@ namespace TurboHost
             _sec = sec;
             _log = log;
             _reportBytes = reportBytes;
+            _getElevatedRestartArgs = getElevatedRestartArgs;
             _config.ApplyPreset(BandwidthProfile.AutoAdaptive);
         }
 
@@ -59,7 +67,15 @@ namespace TurboHost
 
                 await Task.WhenAny(screenTask, receiveTask);
                 sessionCts.Cancel();
-                try { NativeInputInjector.BlockInput(false); } catch { }
+
+                // Close the socket so the other loop's pending read/write fails fast, then wait for BOTH loops
+                // before disposing anything. The screen loop works on raw pointers into the encoder's bitmaps;
+                // disposing the encoder while it was still mid-frame (whenever the viewer disconnected) could
+                // read freed memory and crash the whole host process.
+                try { _client.Close(); } catch { }
+                try { await Task.WhenAll(screenTask, receiveTask); } catch { }
+
+                NativeInputInjector.SendSpecialCombo("LOCK_INPUT_OFF");
                 if (_incomingFileStream != null) _incomingFileStream.Dispose();
                 _urgentTrigger.Dispose();
                 _encoder.Dispose();
@@ -71,59 +87,50 @@ namespace TurboHost
             Stopwatch sw = Stopwatch.StartNew();
             Stopwatch rateWatch = Stopwatch.StartNew();
             long windowBytes = 0;
+            bool captureFailing = false;
 
             while (!ct.IsCancellationRequested && _client.Connected)
             {
                 long frameStart = sw.ElapsedMilliseconds;
+                bool autoAdaptive = _config.Profile == BandwidthProfile.AutoAdaptive;
+                if (autoAdaptive)
+                {
+                    ApplyAdaptiveLevel();
+                }
+
+                int dirtyTiles, nw, nh;
+                byte[] payload;
                 try
                 {
-                    if (_config.Profile == BandwidthProfile.AutoAdaptive)
+                    payload = _encoder.CaptureAndEncodeDelta(_config, out dirtyTiles, out nw, out nh);
+                    if (captureFailing)
                     {
-                        if (_lastFrameSendDurationMs > 160)
-                        {
-                            // Extreme low-bandwidth 2G fallback
-                            _config.Scale = 0.42f;
-                            _config.JpegQuality = 20;
-                            _config.Grayscale = true;
-                            _config.LowBitPosterize = true;
-                            _config.TargetFps = 20;
-                        }
-                        else if (_lastFrameSendDurationMs > 60)
-                        {
-                            // Moderate 3G / WAN
-                            _config.Scale = 0.60f;
-                            _config.JpegQuality = 38;
-                            _config.Grayscale = false;
-                            _config.LowBitPosterize = false;
-                            _config.TargetFps = 30;
-                        }
-                        else if (_lastFrameSendDurationMs > 15)
-                        {
-                            // Standard 4G / Fast WAN
-                            _config.Scale = 0.80f;
-                            _config.JpegQuality = 55;
-                            _config.Grayscale = false;
-                            _config.LowBitPosterize = false;
-                            _config.TargetFps = 45;
-                        }
-                        else
-                        {
-                            // Ultra-fast Local LAN / P2P (<15ms send) -> 60 FPS Native Quality!
-                            _config.Scale = 1.0f;
-                            _config.JpegQuality = 75;
-                            _config.Grayscale = false;
-                            _config.LowBitPosterize = false;
-                            _config.TargetFps = 60;
-                        }
+                        captureFailing = false;
+                        _log("[Stream] Screen capture resumed.");
                     }
+                }
+                catch (Exception ex)
+                {
+                    // Capture throws while the host shows the lock screen or a UAC prompt (secure desktop).
+                    // This used to end the whole session; keep input, shell and files alive and retry instead.
+                    if (!captureFailing)
+                    {
+                        captureFailing = true;
+                        _log("[Stream] Screen capture unavailable (" + ex.Message + "). Retrying...");
+                    }
+                    _encoder.ForceFullKeyFrame();
+                    _urgentTrigger.WaitOne(250);
+                    continue;
+                }
 
-                    int dirtyTiles, nw, nh;
-                    byte[] payload = _encoder.CaptureAndEncodeDelta(_config, out dirtyTiles, out nw, out nh);
+                try
+                {
                     if (dirtyTiles > 0 && payload.Length > 0)
                     {
                         long sendStart = sw.ElapsedMilliseconds;
                         await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.ScreenFrame, payload, ct, _sec);
-                        _lastFrameSendDurationMs = sw.ElapsedMilliseconds - sendStart;
+                        long sendMs = sw.ElapsedMilliseconds - sendStart;
+                        if (autoAdaptive) UpdateAdaptiveLevel(sendMs, sw.ElapsedMilliseconds);
 
                         windowBytes += payload.Length + 65;
                     }
@@ -138,7 +145,7 @@ namespace TurboHost
                 }
                 catch
                 {
-                    break;
+                    break; // connection lost or session cancelled
                 }
 
                 int targetIntervalMs = Math.Max(14, 1000 / Math.Max(10, _config.TargetFps));
@@ -147,6 +154,78 @@ namespace TurboHost
                 // Wait for next frame timer OR wake up IMMEDIATELY when user clicks/types!
                 _urgentTrigger.WaitOne(delay);
             }
+        }
+
+        /// <summary>
+        /// Auto-Adaptive with hysteresis: drop quality as soon as a frame sends slowly, but climb back only one
+        /// level at a time after every frame has been fast for 3 s. Each level change resizes the stream and
+        /// forces a full keyframe; switching on every single frame (as before) flooded slow links with keyframes
+        /// whenever the send time hovered around a threshold.
+        /// </summary>
+        private void UpdateAdaptiveLevel(long sendMs, long nowMs)
+        {
+            int measured = sendMs > 160 ? 0 : sendMs > 60 ? 1 : sendMs > 15 ? 2 : 3;
+            if (measured < _adaptiveLevel)
+            {
+                _adaptiveLevel = measured;
+                _adaptiveHoldStartMs = nowMs;
+            }
+            else if (measured == _adaptiveLevel)
+            {
+                _adaptiveHoldStartMs = nowMs;
+            }
+            else if (nowMs - _adaptiveHoldStartMs >= 3000)
+            {
+                _adaptiveLevel++;
+                _adaptiveHoldStartMs = nowMs;
+            }
+        }
+
+        private void ApplyAdaptiveLevel()
+        {
+            switch (_adaptiveLevel)
+            {
+                case 0:
+                    // Extreme low-bandwidth 2G fallback
+                    _config.Scale = 0.42f;
+                    _config.JpegQuality = 20;
+                    _config.Grayscale = true;
+                    _config.LowBitPosterize = true;
+                    _config.TargetFps = 20;
+                    break;
+                case 1:
+                    // Moderate 3G / WAN
+                    _config.Scale = 0.60f;
+                    _config.JpegQuality = 38;
+                    _config.Grayscale = false;
+                    _config.LowBitPosterize = false;
+                    _config.TargetFps = 30;
+                    break;
+                case 2:
+                    // Standard 4G / Fast WAN
+                    _config.Scale = 0.80f;
+                    _config.JpegQuality = 55;
+                    _config.Grayscale = false;
+                    _config.LowBitPosterize = false;
+                    _config.TargetFps = 45;
+                    break;
+                default:
+                    // Ultra-fast Local LAN / P2P (<15ms send) -> 60 FPS Native Quality!
+                    _config.Scale = 1.0f;
+                    _config.JpegQuality = 75;
+                    _config.Grayscale = false;
+                    _config.LowBitPosterize = false;
+                    _config.TargetFps = 60;
+                    break;
+            }
+
+            // The viewer's "Gray" checkbox used to be overwritten here on every frame in Auto-Adaptive mode.
+            if (_forceGrayscale) _config.Grayscale = true;
+        }
+
+        private void WakeScreenEncoder()
+        {
+            try { _urgentTrigger.Set(); } catch (ObjectDisposedException) { }
         }
 
         private async Task CommandReceiveLoopAsync(CancellationToken ct)
@@ -211,12 +290,9 @@ namespace TurboHost
             float normX = BitConverter.ToSingle(data, 1);
             float normY = BitConverter.ToSingle(data, 5);
             int wheel = BitConverter.ToInt32(data, 9);
-            NativeInputInjector.InjectMouse(action, normX, normY, wheel, _config.MonitorIndex);
-            // If user clicked or scrolled, wake up the screen encoder immediately for 0-ms visual response!
-            if (action != MouseActionType.Move)
-            {
-                _urgentTrigger.Set();
-            }
+            // If user clicked or scrolled, wake up the screen encoder as soon as the click has been injected.
+            NativeInputInjector.InjectMouse(action, normX, normY, wheel, _config.MonitorIndex,
+                action != MouseActionType.Move ? new Action(WakeScreenEncoder) : null);
         }
 
         private void HandleKeyInput(byte[] data)
@@ -224,8 +300,7 @@ namespace TurboHost
             if (data.Length < 3) return;
             ushort vk = BitConverter.ToUInt16(data, 0);
             bool isDown = data[2] == 1;
-            NativeInputInjector.InjectKey(vk, isDown);
-            _urgentTrigger.Set();
+            NativeInputInjector.InjectKey(vk, isDown, WakeScreenEncoder);
         }
 
         private void HandleConfigUpdate(byte[] data)
@@ -236,6 +311,7 @@ namespace TurboHost
             bool forceGray = data[2] == 1;
 
             _config.MonitorIndex = monitorIdx;
+            _forceGrayscale = forceGray;
             if (profile != BandwidthProfile.AutoAdaptive)
             {
                 _config.ApplyPreset(profile);
@@ -256,10 +332,19 @@ namespace TurboHost
             byte[] payloadToSend = null;
             try
             {
+                // Switch the console output encoding to UTF-8 to match how stdout is decoded below; otherwise
+                // non-ASCII output (accented file names, localized messages) arrived garbled. The user's command
+                // goes on its own line so error positions still point at it.
+                string script =
+                    "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }\n" +
+                    command;
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
-                    Arguments = "-NoProfile -NonInteractive -Command \"" + command.Replace("\"", "\\\"") + "\"",
+                    // Proper argv quoting: the old Replace("\"", "\\\"") did not double backslashes, so a command
+                    // ending in a backslash (`dir C:\`) swallowed the closing quote. (-EncodedCommand would avoid
+                    // quoting, but makes Windows PowerShell print errors as CLIXML instead of readable text.)
+                    Arguments = "-NoProfile -NonInteractive -Command " + QuoteWindowsArgument(script),
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -270,15 +355,21 @@ namespace TurboHost
 
                 using (Process proc = Process.Start(psi))
                 {
-                    string stdout = await proc.StandardOutput.ReadToEndAsync();
-                    string stderr = await proc.StandardError.ReadToEndAsync();
-                    proc.WaitForExit(15000);
+                    // Drain stdout and stderr at the same time. Reading stdout to the end first deadlocked
+                    // (forever) as soon as a command wrote more than the pipe buffer to stderr.
+                    Task<string> stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                    Task<string> stderrTask = proc.StandardError.ReadToEndAsync();
+                    await Task.WhenAll(stdoutTask, stderrTask);
+                    string stdout = stdoutTask.Result;
+                    string stderr = stderrTask.Result;
+                    bool exited = proc.WaitForExit(15000);
 
                     StringBuilder sb = new StringBuilder();
                     sb.AppendLine("PS> " + command);
                     if (!string.IsNullOrWhiteSpace(stdout)) sb.AppendLine(stdout.TrimEnd());
                     if (!string.IsNullOrWhiteSpace(stderr)) sb.AppendLine("[STDERR] " + stderr.TrimEnd());
-                    sb.AppendLine("[Exit Code: " + proc.ExitCode + "]");
+                    // ExitCode throws while the process is still running.
+                    sb.AppendLine(exited ? "[Exit Code: " + proc.ExitCode + "]" : "[Still running]");
 
                     payloadToSend = TurboProtocol.CompressFast(Encoding.UTF8.GetBytes(sb.ToString()));
                 }
@@ -290,8 +381,44 @@ namespace TurboHost
 
             if (payloadToSend != null)
             {
-                await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.ShellOutput, payloadToSend, ct, _sec);
+                try
+                {
+                    await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.ShellOutput, payloadToSend, ct, _sec);
+                }
+                catch { } // viewer disconnected while the command was running
             }
+        }
+
+        /// <summary>
+        /// Quotes one argument with the standard Windows (CommandLineToArgvW) rules: backslashes are literal
+        /// except right before a quote, where they must be doubled - including before the closing quote.
+        /// </summary>
+        private static string QuoteWindowsArgument(string arg)
+        {
+            StringBuilder sb = new StringBuilder(arg.Length + 8);
+            sb.Append('"');
+            int backslashes = 0;
+            foreach (char c in arg)
+            {
+                if (c == '\\')
+                {
+                    backslashes++;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    sb.Append('\\', backslashes * 2 + 1);
+                }
+                else
+                {
+                    sb.Append('\\', backslashes);
+                }
+                sb.Append(c);
+                backslashes = 0;
+            }
+            sb.Append('\\', backslashes * 2);
+            sb.Append('"');
+            return sb.ToString();
         }
 
         private void SetHostClipboard(string text)
@@ -316,8 +443,21 @@ namespace TurboHost
             {
                 if (!NativeInputInjector.IsRunningAsAdmin())
                 {
-                    NativeInputInjector.RestartAsAdmin("");
-                    Environment.Exit(0);
+                    // Off the receive loop: the UAC prompt blocks until someone at the host answers it.
+                    Task.Run(() =>
+                    {
+                        // Restart in Host mode with the same port/PIN. With no arguments the elevated copy
+                        // opened the launcher instead of the host server, and this process exited even when
+                        // the UAC prompt was declined - either way the remote viewer lost the host for good.
+                        string restartArgs = "--host";
+                        try { if (_getElevatedRestartArgs != null) restartArgs = _getElevatedRestartArgs(); } catch { }
+
+                        if (NativeInputInjector.RestartAsAdmin(restartArgs))
+                        {
+                            Environment.Exit(0);
+                        }
+                        _log("[SystemAction] UAC elevation was declined or failed; host keeps running unelevated.");
+                    });
                 }
                 return;
             }
@@ -385,6 +525,12 @@ namespace TurboHost
             try
             {
                 if (_incomingFileStream != null) _incomingFileStream.Dispose();
+                _incomingFileStream = null;
+                // A bare file name means "the host's default folder" (the viewer cannot know this host's profile path).
+                if (!Path.IsPathRooted(targetFilePath))
+                {
+                    targetFilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), targetFilePath);
+                }
                 string dir = Path.GetDirectoryName(targetFilePath);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                 _incomingFilePath = targetFilePath;
@@ -400,8 +546,18 @@ namespace TurboHost
         private async Task HandleFileUploadChunkAsync(byte[] compressedChunk, CancellationToken ct)
         {
             if (_incomingFileStream == null) return;
-            byte[] raw = TurboProtocol.DecompressFast(compressedChunk);
-            await _incomingFileStream.WriteAsync(raw, 0, raw.Length, ct);
+            try
+            {
+                byte[] raw = TurboProtocol.DecompressFast(compressedChunk);
+                await _incomingFileStream.WriteAsync(raw, 0, raw.Length, ct);
+            }
+            catch (Exception ex)
+            {
+                // e.g. disk full: abort this upload instead of letting the exception end the whole session.
+                _log("[FileTransfer Error] Upload aborted: " + ex.Message);
+                try { _incomingFileStream.Dispose(); } catch { }
+                _incomingFileStream = null;
+            }
         }
 
         private async Task HandleFileUploadEndAsync(CancellationToken ct)
@@ -417,9 +573,18 @@ namespace TurboHost
 
         private async Task SendFileToClientAsync(string sourcePath, CancellationToken ct)
         {
+            // One download at a time: chunks carry no file id, so two parallel downloads interleaved their
+            // chunks into the same stream and corrupted both files on the viewer.
+            try { await _downloadLock.WaitAsync(ct); }
+            catch (OperationCanceledException) { return; }
+
             try
             {
-                if (!File.Exists(sourcePath)) return;
+                if (!File.Exists(sourcePath))
+                {
+                    _log("[FileTransfer Error] File not found: " + sourcePath);
+                    return;
+                }
                 string fileName = Path.GetFileName(sourcePath);
                 _log("[FileTransfer] Sending " + fileName + " to client...");
 
@@ -444,6 +609,10 @@ namespace TurboHost
             catch (Exception ex)
             {
                 _log("[FileTransfer Error] " + ex.Message);
+            }
+            finally
+            {
+                _downloadLock.Release();
             }
         }
     }
@@ -575,7 +744,7 @@ namespace TurboHost
                     MessageBox.Show("TurboHost is already running with full Administrator privileges!", "Administrator Active", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
-                if (NativeInputInjector.RestartAsAdmin(string.Format("--port {0} --pin {1}", _txtPort.Text, _txtPin.Text)))
+                if (NativeInputInjector.RestartAsAdmin(BuildElevatedRestartArgs()))
                 {
                     Application.Exit();
                 }
@@ -731,6 +900,7 @@ namespace TurboHost
             Controls.Add(grpLog);
         }
 
+        /// <summary>Safe from any thread: the text boxes are read through Invoke when needed.</summary>
         private async Task PublishTicketToCloudDirectoryAsync()
         {
             string portStr = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim())) : _txtPort.Text.Trim();
@@ -742,7 +912,8 @@ namespace TurboHost
             string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
 
             Log(string.Format("[Cloud Discovery] Publishing AES-256 encrypted endpoints for Host ID '{0}'...", room));
-            bool ok = await SmartRouteEngine.PublishHostTicketToCloudAsync(room, pin, ticket);
+            // Key derivation and the HTTP request (whose DNS lookup is synchronous) run off the UI thread.
+            bool ok = await Task.Run(() => SmartRouteEngine.PublishHostTicketToCloudAsync(room, pin, ticket));
             if (ok)
             {
                 Log(string.Format("[Cloud Discovery READY] Client can now type Host ID '{0}' and PIN '{1}' from anywhere on the Internet!", room, pin));
@@ -817,11 +988,18 @@ namespace TurboHost
                 {
                     _activePublicTunnelEndpoint = endpoint;
                     Log("[PUBLIC INTERNET TUNNEL ACTIVE] -> " + endpoint);
-                    BeginInvoke(new Action(async () =>
+                    // This runs on an ssh output thread: an exception here (form already closed) would
+                    // crash the process, so guard the cross-thread call.
+                    if (IsDisposed || !IsHandleCreated) return;
+                    try
                     {
-                        _lstEndpoints.Items.Insert(0, endpoint + " (Public Internet Tunnel)");
-                        await PublishTicketToCloudDirectoryAsync();
-                    }));
+                        BeginInvoke(new Action(async () =>
+                        {
+                            _lstEndpoints.Items.Insert(0, endpoint + " (Public Internet Tunnel)");
+                            await PublishTicketToCloudDirectoryAsync();
+                        }));
+                    }
+                    catch (InvalidOperationException) { }
                 }
             }
         }
@@ -876,7 +1054,7 @@ namespace TurboHost
             else await StartServerAsync();
         }
 
-        private async Task AutoOpenFirewallUpnpAndTunnelAsync(int port)
+        private async Task AutoOpenFirewallUpnpAndTunnelAsync(int port, CancellationToken ct)
         {
             // 1. Automatically open Windows Firewall inbound rule (if running as Admin)
             if (NativeInputInjector.IsRunningAsAdmin())
@@ -901,12 +1079,12 @@ namespace TurboHost
             StartBuiltInPublicSshTunnel();
 
             // 4. Periodically refresh Cloud Rendezvous ticket every 4 minutes so Internet clients can always find this Host
-            while (_isRunning && _serverCts != null && !_serverCts.Token.IsCancellationRequested)
+            while (_isRunning && !ct.IsCancellationRequested)
             {
                 await PublishTicketToCloudDirectoryAsync();
                 try
                 {
-                    await Task.Delay(240000, _serverCts.Token);
+                    await Task.Delay(240000, ct);
                 }
                 catch
                 {
@@ -925,15 +1103,22 @@ namespace TurboHost
                 return;
             }
 
+            // Work on locals: after Stop + quick re-Start the fields point at the NEW listener, and the old
+            // accept loop's exception must not stop that new server.
+            CancellationTokenSource cts = new CancellationTokenSource();
+            TcpListener listener = null;
+            bool started = false;
             try
             {
-                _serverCts = new CancellationTokenSource();
-                _listener = new TcpListener(IPAddress.Any, port);
-                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                _listener.Start();
+                _serverCts = cts;
+                listener = new TcpListener(IPAddress.Any, port);
+                _listener = listener;
+                listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                listener.Start();
+                started = true;
 
                 // Start zero-config UDP LAN Auto-Discovery Beacon on port 9878
-                SmartRouteEngine.StartLanBeaconResponder(() => port, _serverCts.Token);
+                SmartRouteEngine.StartLanBeaconResponder(() => port, cts.Token);
 
                 _isRunning = true;
                 _btnStartStop.Text = "⏹ Stop Host Server";
@@ -943,18 +1128,27 @@ namespace TurboHost
 
                 Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, PIN: {2})", port, _txtRoomId.Text, _txtPin.Text));
 
-                // Automatically open Firewall, map UPnP router port, launch Public Internet Tunnel, and publish to Cloud
-                Task.Run(() => AutoOpenFirewallUpnpAndTunnelAsync(port));
+                // Automatically open Firewall, map UPnP router port, launch Public Internet Tunnel, and publish to Cloud.
+                // Pass THIS server's token so a quick Stop + Start cannot leave two publish loops running.
+                CancellationToken autoToken = cts.Token;
+                Task.Run(() => AutoOpenFirewallUpnpAndTunnelAsync(port, autoToken));
 
-                while (!_serverCts.Token.IsCancellationRequested)
+                while (!cts.Token.IsCancellationRequested)
                 {
-                    TcpClient client = await _listener.AcceptTcpClientAsync();
-                    Task.Run(() => HandleClientSessionAsync(client, _serverCts.Token));
+                    TcpClient client = await listener.AcceptTcpClientAsync();
+                    CancellationToken sessionToken = cts.Token;
+                    Task.Run(() => HandleClientSessionAsync(client, sessionToken));
                 }
             }
             catch (Exception ex)
             {
-                if (_isRunning)
+                if (!started)
+                {
+                    // Used to be swallowed silently, leaving the user with a server that never started.
+                    Log("[Server] Could not start listener on port " + port + ": " + ex.Message);
+                    try { if (listener != null) listener.Stop(); } catch { }
+                }
+                else if (_isRunning && ReferenceEquals(listener, _listener))
                 {
                     Log("[Server] Stopped: " + ex.Message);
                     StopServer();
@@ -1000,8 +1194,11 @@ namespace TurboHost
                 client.NoDelay = true;
                 await client.ConnectAsync(host, port);
                 Log(string.Format("[Reverse] Connected to {0}:{1}!", host, port));
-                if (_serverCts == null) _serverCts = new CancellationTokenSource();
-                Task.Run(() => HandleClientSessionAsync(client, _serverCts.Token));
+                // After "Stop Host Server" the old token is already cancelled, which killed the reverse
+                // session the moment it started.
+                if (_serverCts == null || _serverCts.IsCancellationRequested) _serverCts = new CancellationTokenSource();
+                CancellationToken sessionToken = _serverCts.Token;
+                Task.Run(() => HandleClientSessionAsync(client, sessionToken));
             }
             catch (Exception ex)
             {
@@ -1012,7 +1209,9 @@ namespace TurboHost
         private async Task HandleClientSessionAsync(TcpClient client, CancellationToken ct)
         {
             string remoteEp = client.Client.RemoteEndPoint != null ? client.Client.RemoteEndPoint.ToString() : "Unknown";
-            string remoteIpOnly = remoteEp.Split(':')[0];
+            // Split(':') turned every IPv6 peer ("[2001:db8::1]:5000") into "[", sharing one lockout bucket.
+            IPEndPoint remoteIpEp = client.Client.RemoteEndPoint as IPEndPoint;
+            string remoteIpOnly = remoteIpEp != null ? remoteIpEp.Address.ToString() : remoteEp;
 
             int lockoutRemaining;
             if (BruteForceProtector.IsIpLockedOut(remoteIpOnly, out lockoutRemaining))
@@ -1075,7 +1274,7 @@ namespace TurboHost
                         await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes(machineInfo), ct, sec);
                         Log("[Security VERIFIED] " + remoteEp + " authenticated via Zero-Knowledge PBKDF2-SHA256 & AES-256 E2EE.");
 
-                        ClientSessionHandler session = new ClientSessionHandler(client, stream, writeLock, sec, Log, AddBytesSent);
+                        ClientSessionHandler session = new ClientSessionHandler(client, stream, writeLock, sec, Log, AddBytesSent, BuildElevatedRestartArgs);
                         await session.RunAsync(ct);
                     }
                 }
@@ -1090,6 +1289,27 @@ namespace TurboHost
                 UpdateStatsLabel(0);
                 try { client.Close(); } catch { }
             }
+        }
+
+        /// <summary>Command line that restarts this PC as an elevated Host with the same port and PIN.</summary>
+        private string BuildElevatedRestartArgs()
+        {
+            if (InvokeRequired)
+            {
+                return (string)Invoke(new Func<string>(BuildElevatedRestartArgs));
+            }
+            return string.Format("--host --port {0} --pin \"{1}\"", _txtPort.Text.Trim(), _txtPin.Text.Trim());
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            // Stop first so the tunnel watchdog does not schedule a restart when the tunnel is killed below.
+            _isRunning = false;
+            try { if (_serverCts != null) _serverCts.Cancel(); } catch { }
+            try { if (_listener != null) _listener.Stop(); } catch { }
+            // The ssh.exe tunnel used to outlive TurboRemote as an orphan process, keeping the public relay open.
+            try { if (_tunnelProc != null && !_tunnelProc.HasExited) _tunnelProc.Kill(); } catch { }
+            base.OnFormClosed(e);
         }
 
         private string GetPinThreadSafe()

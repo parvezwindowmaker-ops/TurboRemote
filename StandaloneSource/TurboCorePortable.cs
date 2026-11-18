@@ -287,6 +287,12 @@ namespace TurboCore
             AttemptRecord rec = _records.GetOrAdd(ip, _ => new AttemptRecord());
             lock (rec)
             {
+                // A previous 5-minute lockout has expired: start a fresh window of 5 attempts instead of
+                // re-locking the IP on its very next mistake ("Attempt 6/5").
+                if (rec.Failures >= 5 && DateTime.UtcNow >= rec.LockoutUntilUtc)
+                {
+                    rec.Failures = 0;
+                }
                 rec.Failures++;
                 if (rec.Failures >= 5)
                 {
@@ -361,22 +367,25 @@ namespace TurboCore
         public static async Task SendPacketAsync(Stream stream, SemaphoreSlim writeLock, PacketType type, byte[] payload, CancellationToken ct, SecurityContext sec = null)
         {
             if (payload == null) payload = new byte[0];
-            byte[] wirePayload = (sec != null) ? sec.EncryptAndAuthenticate(type, payload) : payload;
-
-            byte[] header = new byte[9];
-            Buffer.BlockCopy(MagicHeader, 0, header, 0, 4);
-            header[4] = (byte)type;
-            byte[] lenBytes = BitConverter.GetBytes(wirePayload.Length);
-            Buffer.BlockCopy(lenBytes, 0, header, 5, 4);
 
             await writeLock.WaitAsync(ct);
             try
             {
-                await stream.WriteAsync(header, 0, header.Length, ct);
-                if (wirePayload.Length > 0)
-                {
-                    await stream.WriteAsync(wirePayload, 0, wirePayload.Length, ct);
-                }
+                // Encrypt while holding the write lock. EncryptAndAuthenticate assigns the anti-replay
+                // sequence number, and the receiver rejects any packet whose number is not higher than the
+                // last one. Encrypting before taking the lock let concurrent senders (screen frames, pongs,
+                // shell output, key/mouse input) reach the wire out of order, and the receiver then dropped
+                // the whole session as a "replay attack".
+                byte[] wirePayload = (sec != null) ? sec.EncryptAndAuthenticate(type, payload) : payload;
+
+                // Header and payload in one write, so a small input packet is one TCP segment, not two.
+                byte[] frame = new byte[9 + wirePayload.Length];
+                Buffer.BlockCopy(MagicHeader, 0, frame, 0, 4);
+                frame[4] = (byte)type;
+                Buffer.BlockCopy(BitConverter.GetBytes(wirePayload.Length), 0, frame, 5, 4);
+                Buffer.BlockCopy(wirePayload, 0, frame, 9, wirePayload.Length);
+
+                await stream.WriteAsync(frame, 0, frame.Length, ct);
                 await stream.FlushAsync(ct);
             }
             finally
@@ -522,7 +531,11 @@ namespace TurboCore
         private const int DESKTOPHORZRES = 118;
         private const int DESKTOPVERTRES = 117;
 
-        public static Rectangle GetPhysicalMonitorBounds(int monitorIndex)
+        /// <summary>
+        /// Monitor bounds in this process's (DPI-virtualized) coordinate space. TurboRemote is DPI-unaware,
+        /// so these are logical coordinates on a scaled display - the space SetCursorPos works in.
+        /// </summary>
+        public static Rectangle GetLogicalMonitorBounds(int monitorIndex)
         {
             System.Windows.Forms.Screen[] screens = System.Windows.Forms.Screen.AllScreens;
             if (screens.Length == 0) return new Rectangle(0, 0, 1920, 1080);
@@ -530,8 +543,15 @@ namespace TurboCore
             int monIdx = monitorIndex;
             if (monIdx < 0) monIdx = 0;
             if (monIdx >= screens.Length) monIdx = screens.Length - 1;
+            return screens[monIdx].Bounds;
+        }
 
-            Rectangle logical = screens[monIdx].Bounds;
+        /// <summary>
+        /// Monitor bounds in physical pixels - the space screen capture (BitBlt) works in.
+        /// </summary>
+        public static Rectangle GetPhysicalMonitorBounds(int monitorIndex)
+        {
+            Rectangle logical = GetLogicalMonitorBounds(monitorIndex);
 
             try
             {
@@ -541,10 +561,13 @@ namespace TurboCore
                     int physW = GetDeviceCaps(hdc, DESKTOPHORZRES);
                     int physH = GetDeviceCaps(hdc, DESKTOPVERTRES);
                     ReleaseDC(IntPtr.Zero, hdc);
-                    if (physW > 0 && physH > 0 && logical.Width > 0)
+                    // DESKTOPHORZRES/VERTRES describe the PRIMARY monitor, so compare against the primary
+                    // screen (Screen.AllScreens[0] is not guaranteed to be the primary one).
+                    Rectangle primary = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
+                    if (physW > 0 && physH > 0 && primary.Width > 0 && primary.Height > 0)
                     {
-                        float scaleX = (float)physW / (float)screens[0].Bounds.Width;
-                        float scaleY = (float)physH / (float)screens[0].Bounds.Height;
+                        float scaleX = (float)physW / (float)primary.Width;
+                        float scaleY = (float)physH / (float)primary.Height;
                         if (scaleX > 1.01f || scaleY > 1.01f)
                         {
                             return new Rectangle(
@@ -650,20 +673,7 @@ namespace TurboCore
                         int startX = gx * tileW;
                         int w = (gx == GridCols - 1) ? (scaledW - startX) : tileW;
 
-                        ulong hash = 14695981039346656037UL;
-                        for (int y = startY; y < startY + h; y += 2)
-                        {
-                            byte* row = basePtr + (y * stride) + (startX * 3);
-                            for (int x = 0; x < w * 3; x += 6)
-                            {
-                                ulong b0 = (ulong)(row[x] & 0xF8);
-                                ulong b1 = (ulong)(row[x + 1] & 0xF8);
-                                ulong b2 = (ulong)(row[x + 2] & 0xF8);
-                                ulong sample = (b0 << 16) | (b1 << 8) | b2;
-                                hash ^= sample;
-                                hash *= 1099511628211UL;
-                            }
-                        }
+                        ulong hash = HashTile(basePtr, stride, startX, startY, w, h);
 
                         newHashes[gx, gy] = hash;
                         if (forceFull || _prevTileHashes[gx, gy] != hash)
@@ -722,6 +732,36 @@ namespace TurboCore
                 bw.Flush();
                 return TurboProtocol.CompressFast(packetMs.ToArray());
             }
+        }
+
+        /// <summary>
+        /// FNV-style hash over EVERY byte of a 24bpp tile, read 8 bytes at a time. The previous version only
+        /// sampled every other row and every other pixel with the low 3 bits masked off, so 1-pixel changes
+        /// (text caret, thin glyphs like "l" or ".", focus rectangles, subtle hover colours) never marked the
+        /// tile dirty and only showed up at the next periodic keyframe, seconds later.
+        /// </summary>
+        private static unsafe ulong HashTile(byte* basePtr, int stride, int startX, int startY, int w, int h)
+        {
+            ulong hash = 14695981039346656037UL;
+            int rowBytes = w * 3;
+            int wordCount = rowBytes >> 3;
+            int tailStart = wordCount << 3;
+            for (int y = startY; y < startY + h; y++)
+            {
+                byte* row = basePtr + (y * stride) + (startX * 3);
+                ulong* words = (ulong*)row;
+                for (int i = 0; i < wordCount; i++)
+                {
+                    hash ^= words[i];
+                    hash *= 1099511628211UL;
+                }
+                for (int i = tailStart; i < rowBytes; i++)
+                {
+                    hash ^= row[i];
+                    hash *= 1099511628211UL;
+                }
+            }
+            return hash;
         }
 
         public static void ApplyDeltaFrame(byte[] compressedPayload, ref Bitmap canvasBitmap, out int nativeWidth, out int nativeHeight, out int scaledWidth, out int scaledHeight, out int updatedTiles)
@@ -786,8 +826,9 @@ namespace TurboCore
         [DllImport("user32.dll", SetLastError = true)]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+        // Private on purpose: only call it through the input thread (see PostToInputThread).
         [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool BlockInput(bool fBlockIt);
+        private static extern bool BlockInput(bool fBlockIt);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint SetThreadExecutionState(uint esFlags);
@@ -806,6 +847,42 @@ namespace TurboCore
 
         private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        // Every BlockInput call and every injected mouse/key event runs on ONE dedicated thread, in order.
+        // Windows only lets the thread that called BlockInput(true) unblock input again, but session packets
+        // are handled on arbitrary thread-pool threads, so "Unlock Input" (and the unlock when a viewer
+        // disconnects) could silently fail and leave the host's physical keyboard and mouse locked.
+        private static volatile BlockingCollection<Action> _inputQueue;
+        private static readonly object _inputQueueInitLock = new object();
+
+        private static void PostToInputThread(Action action)
+        {
+            BlockingCollection<Action> queue = _inputQueue;
+            if (queue == null)
+            {
+                lock (_inputQueueInitLock)
+                {
+                    queue = _inputQueue;
+                    if (queue == null)
+                    {
+                        BlockingCollection<Action> newQueue = new BlockingCollection<Action>();
+                        Thread worker = new Thread(() =>
+                        {
+                            foreach (Action work in newQueue.GetConsumingEnumerable())
+                            {
+                                try { work(); } catch { }
+                            }
+                        });
+                        worker.IsBackground = true;
+                        worker.Name = "TurboRemote Input Injector";
+                        worker.Start();
+                        _inputQueue = newQueue;
+                        queue = newQueue;
+                    }
+                }
+            }
+            queue.Add(action);
+        }
 
         public static void PreventSystemSleep()
         {
@@ -878,19 +955,33 @@ namespace TurboCore
             }
         }
 
-        public static void InjectMouse(MouseActionType action, float normX, float normY, int wheelDelta, int monitorIndex)
+        /// <summary>Queues a mouse event; <paramref name="onInjected"/> runs right after it was injected.</summary>
+        public static void InjectMouse(MouseActionType action, float normX, float normY, int wheelDelta, int monitorIndex, Action onInjected = null)
+        {
+            PostToInputThread(() =>
+            {
+                InjectMouseNow(action, normX, normY, wheelDelta, monitorIndex);
+                if (onInjected != null) onInjected();
+            });
+        }
+
+        private static void InjectMouseNow(MouseActionType action, float normX, float normY, int wheelDelta, int monitorIndex)
         {
             try
             {
-                Rectangle bounds = DeltaScreenEncoder.GetPhysicalMonitorBounds(monitorIndex);
+                // TurboRemote runs DPI-unaware, so SetCursorPos takes LOGICAL (DPI-virtualized) coordinates even
+                // though frames are captured in physical pixels. Using the physical bounds here put every click
+                // 1.25x / 1.5x too far right and down on a scaled display (and pinned it to the screen edge).
+                Rectangle bounds = DeltaScreenEncoder.GetLogicalMonitorBounds(monitorIndex);
 
-                if (normX < 0f) normX = 0f;
+                if (float.IsNaN(normX) || normX < 0f) normX = 0f;
                 if (normX > 1f) normX = 1f;
-                if (normY < 0f) normY = 0f;
+                if (float.IsNaN(normY) || normY < 0f) normY = 0f;
                 if (normY > 1f) normY = 1f;
 
-                int targetX = bounds.X + (int)Math.Round(normX * bounds.Width);
-                int targetY = bounds.Y + (int)Math.Round(normY * bounds.Height);
+                // Clamp to the last pixel so x = 1.0 cannot land on the first column of the next monitor.
+                int targetX = bounds.X + Math.Min(bounds.Width - 1, (int)Math.Round(normX * bounds.Width));
+                int targetY = bounds.Y + Math.Min(bounds.Height - 1, (int)Math.Round(normY * bounds.Height));
 
                 SetCursorPos(targetX, targetY);
 
@@ -922,7 +1013,17 @@ namespace TurboCore
             catch { }
         }
 
-        public static void InjectKey(ushort virtualKeyCode, bool isKeyDown)
+        /// <summary>Queues a key event; <paramref name="onInjected"/> runs right after it was injected.</summary>
+        public static void InjectKey(ushort virtualKeyCode, bool isKeyDown, Action onInjected = null)
+        {
+            PostToInputThread(() =>
+            {
+                InjectKeyNow(virtualKeyCode, isKeyDown);
+                if (onInjected != null) onInjected();
+            });
+        }
+
+        private static void InjectKeyNow(ushort virtualKeyCode, bool isKeyDown)
         {
             try
             {
@@ -946,39 +1047,44 @@ namespace TurboCore
 
         public static void SendSpecialCombo(string comboName)
         {
+            PostToInputThread(() => SendSpecialComboNow(comboName));
+        }
+
+        private static void SendSpecialComboNow(string comboName)
+        {
             switch (comboName)
             {
                 case "WIN_D":
-                    InjectKey(0x5B, true);
-                    InjectKey(0x44, true);
-                    InjectKey(0x44, false);
-                    InjectKey(0x5B, false);
+                    InjectKeyNow(0x5B, true);
+                    InjectKeyNow(0x44, true);
+                    InjectKeyNow(0x44, false);
+                    InjectKeyNow(0x5B, false);
                     break;
                 case "ALT_TAB":
-                    InjectKey(0x12, true);
-                    InjectKey(0x09, true);
-                    InjectKey(0x09, false);
-                    InjectKey(0x12, false);
+                    InjectKeyNow(0x12, true);
+                    InjectKeyNow(0x09, true);
+                    InjectKeyNow(0x09, false);
+                    InjectKeyNow(0x12, false);
                     break;
                 case "TASK_MGR":
-                    InjectKey(0x11, true);
-                    InjectKey(0x10, true);
-                    InjectKey(0x1B, true);
-                    InjectKey(0x1B, false);
-                    InjectKey(0x10, false);
-                    InjectKey(0x11, false);
+                    InjectKeyNow(0x11, true);
+                    InjectKeyNow(0x10, true);
+                    InjectKeyNow(0x1B, true);
+                    InjectKeyNow(0x1B, false);
+                    InjectKeyNow(0x10, false);
+                    InjectKeyNow(0x11, false);
                     break;
                 case "ALT_F4":
-                    InjectKey(0x12, true);
-                    InjectKey(0x73, true);
-                    InjectKey(0x73, false);
-                    InjectKey(0x12, false);
+                    InjectKeyNow(0x12, true);
+                    InjectKeyNow(0x73, true);
+                    InjectKeyNow(0x73, false);
+                    InjectKeyNow(0x12, false);
                     break;
                 case "WIN_R":
-                    InjectKey(0x5B, true);
-                    InjectKey(0x52, true);
-                    InjectKey(0x52, false);
-                    InjectKey(0x5B, false);
+                    InjectKeyNow(0x5B, true);
+                    InjectKeyNow(0x52, true);
+                    InjectKeyNow(0x52, false);
+                    InjectKeyNow(0x5B, false);
                     break;
                 case "LOCK_INPUT_ON":
                     BlockInput(true);
@@ -1149,6 +1255,8 @@ namespace TurboCore
             return string.Join(",", endpoints);
         }
 
+        private const int SIO_UDP_CONNRESET = unchecked((int)0x9800000C);
+
         public static void StartLanBeaconResponder(Func<int> getTcpPort, CancellationToken ct)
         {
             Task.Run(async () =>
@@ -1156,21 +1264,47 @@ namespace TurboCore
                 try
                 {
                     using (UdpClient udp = new UdpClient(DiscoveryUdpPort))
+                    // ReceiveAsync ignores the token, so close the socket on cancel. Otherwise a stopped server
+                    // kept answering discovery probes (with its old port) and held UDP 9878, so the beacon of
+                    // the next "Start Host Server" could not bind and LAN AUTO discovery stopped working.
+                    using (ct.Register(() => { try { udp.Close(); } catch { } }))
                     {
+                        // Windows reports an ICMP "port unreachable" (from a viewer that already stopped
+                        // listening) as an error on the NEXT receive, which used to kill the responder for good.
+                        try { udp.Client.IOControl(SIO_UDP_CONNRESET, new byte[] { 0, 0, 0, 0 }, null); } catch { }
+
                         while (!ct.IsCancellationRequested)
                         {
-                            UdpReceiveResult res = await udp.ReceiveAsync();
+                            UdpReceiveResult res;
+                            try
+                            {
+                                res = await udp.ReceiveAsync();
+                            }
+                            catch (SocketException)
+                            {
+                                res = default(UdpReceiveResult); // transient per-datagram error
+                            }
+                            if (res.Buffer == null)
+                            {
+                                await Task.Delay(50, ct); // back off; throws (and exits) once cancelled
+                                continue;
+                            }
+
                             string msg = Encoding.UTF8.GetString(res.Buffer);
                             if (msg == "TRBO_DISCOVER")
                             {
                                 string reply = "TRBO_HOST|" + Environment.MachineName + "|" + getTcpPort();
                                 byte[] replyBytes = Encoding.UTF8.GetBytes(reply);
-                                await udp.SendAsync(replyBytes, replyBytes.Length, res.RemoteEndPoint);
+                                try
+                                {
+                                    await udp.SendAsync(replyBytes, replyBytes.Length, res.RemoteEndPoint);
+                                }
+                                catch (SocketException) { }
                             }
                         }
                     }
                 }
-                catch { }
+                catch { } // port 9878 already in use, or socket closed because the server stopped
             }, ct);
         }
 
@@ -1196,7 +1330,9 @@ namespace TurboCore
                         if (text.StartsWith("TRBO_HOST|"))
                         {
                             string[] parts = text.Split('|');
-                            int port = parts.Length > 2 ? int.Parse(parts[2]) : 9876;
+                            int port;
+                            // One malformed reply must not abort discovery of the other hosts.
+                            if (parts.Length < 3 || !int.TryParse(parts[2], out port)) port = 9876;
                             string ip = recvTask.Result.RemoteEndPoint.Address.ToString();
                             found.Add(new EndpointCandidate
                             {
@@ -1269,9 +1405,10 @@ namespace TurboCore
             if (candidates.Count == 1)
             {
                 EndpointCandidate primary = candidates[0];
+                TcpClient fastTcp = new TcpClient();
+                bool fastPathWon = false;
                 try
                 {
-                    TcpClient fastTcp = new TcpClient();
                     fastTcp.NoDelay = true;
                     Task fastConnect = fastTcp.ConnectAsync(primary.Host, primary.Port);
                     Task done = await Task.WhenAny(fastConnect, Task.Delay(700, ct));
@@ -1281,10 +1418,10 @@ namespace TurboCore
                         await fastConnect; // throws if refused/unreachable
                         if (fastTcp.Connected)
                         {
+                            fastPathWon = true;
                             return new KeyValuePair<TcpClient, EndpointCandidate>(fastTcp, primary);
                         }
                     }
-                    try { fastTcp.Close(); } catch { }
                 }
                 catch (OperationCanceledException)
                 {
@@ -1293,6 +1430,11 @@ namespace TurboCore
                 catch
                 {
                     // Fall through to UDP LAN broadcast + Cloud Rendezvous below
+                }
+                finally
+                {
+                    // Also close it when the user cancels; it used to leak a half-open connection attempt.
+                    if (!fastPathWon) { try { fastTcp.Close(); } catch { } }
                 }
             }
 
