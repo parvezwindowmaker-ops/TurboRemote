@@ -12,7 +12,7 @@ namespace TurboUnified
     {
         public UnifiedLauncherForm()
         {
-            Text = "TurboRemote All-In-One Portable EXE (AES-256 E2EE • 2G Ultra-Low Bandwidth)";
+            Text = "TurboRemote";
             Size = new Size(560, 360);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 26);
@@ -23,7 +23,7 @@ namespace TurboUnified
 
             Label lblTitle = new Label
             {
-                Text = "⚡ TURBOREMOTE ALL-IN-ONE",
+                Text = "⚡ TURBOREMOTE",
                 Font = new Font("Segoe UI", 16f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(90, 200, 255),
                 Location = new Point(24, 18),

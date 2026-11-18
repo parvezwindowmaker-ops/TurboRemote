@@ -1,14 +1,14 @@
-# ⚡ TurboRemote All-In-One — Ultra-Low Bandwidth Windows Remote Suite
+# ⚡ TurboRemote — Ultra-Low Bandwidth Windows Remote Suite
 
-Everything is compiled into **one single zero-dependency executable (`128 KB`)** that runs on any Windows 10/11 machine without installing Python or .NET Core:
+Everything is compiled into **one single zero-dependency executable (`136 KB`)** that runs on any Windows 10/11 machine without installing Python or .NET Core:
 
-👉 **[`TurboRemote_AllInOne.exe`](file:///C:/Users/Parvezkhan%20Pathan/.gemini/antigravity/scratch/TurboRemote/TurboRemote_AllInOne.exe)**
+👉 **[`TurboRemote.exe`](file:///C:/Users/Parvezkhan%20Pathan/.gemini/antigravity/scratch/TurboRemote/TurboRemote.exe)**
 
 ---
 
 ## 🚀 Smart-Route Racing (Local LAN First, Automatic Internet Fallback)
 
-`TurboRemote_AllInOne.exe` uses **`SmartRouteEngine` (Happy Eyeballs Parallel TCP + UDP Discovery)** to automatically pick the fastest path:
+`TurboRemote.exe` uses **`SmartRouteEngine` (Happy Eyeballs Parallel TCP + UDP Discovery)** to automatically pick the fastest path:
 
 1. **Zero-Config Local LAN Auto-Discovery (`AUTO`)**:
    - The Host runs an active UDP LAN responder on port `9878`.

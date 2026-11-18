@@ -456,7 +456,7 @@ namespace TurboHost
 
         public HostMainForm()
         {
-            Text = "TurboHost Standalone Portable EXE — Zero-Dependency Ultra-Low Bandwidth Remote Server";
+            Text = "TurboRemote — Host Server";
             Size = new Size(775, 645);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(18, 20, 28);
@@ -482,7 +482,7 @@ namespace TurboHost
 
             Label lblTitle = new Label
             {
-                Text = "⚡ TURBOHOST PORTABLE (SINGLE-FILE ZERO-DEPENDENCY EXE)",
+                Text = "⚡ TURBOREMOTE",
                 Font = new Font("Segoe UI", 13f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(88, 196, 255),
                 Location = new Point(16, 10),

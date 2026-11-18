@@ -71,7 +71,7 @@ namespace TurboClient
 
         public ClientMainForm()
         {
-            Text = "TurboClient Standalone Portable EXE — Zero-Dependency Ultra-Low Bandwidth Remote Viewer";
+            Text = "TurboRemote — Viewer Client";
             Size = new Size(1250, 800);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 24);
