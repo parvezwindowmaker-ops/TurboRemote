@@ -644,6 +644,14 @@ namespace TurboHost
         private long _totalBytesSent = 0;
         private int _connectedClients = 0;
 
+        // The key saved in %LOCALAPPDATA%\TurboRemote\access_key.txt, and a --pin key used for this run only.
+        private string _savedAccessKey;
+        private string _commandLineKey;
+        // The weak key Internet access was last refused for, so the warning is not repeated every few minutes.
+        private string _lastRefusedKey;
+        private System.Windows.Forms.Timer _keyApplyTimer;
+        private int _listenPort;
+
         public HostMainForm()
         {
             Text = "TurboRemote — Host Server";
@@ -654,6 +662,11 @@ namespace TurboHost
             Font = new Font("Segoe UI", 9.2f, FontStyle.Regular);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
+
+            string keyNote;
+            _savedAccessKey = AccessKeyStore.LoadOrCreate(out keyNote);
+            // Log needs a window handle, so report a first-run key once the form is shown.
+            if (keyNote != null) Shown += (s, e) => Log(keyNote);
 
             NativeInputInjector.PreventSystemSleep();
             InitializeUi();
@@ -717,7 +730,7 @@ namespace TurboHost
             Label lblPin = new Label { Text = "Access Key/PIN:", Location = new Point(16, 60), AutoSize = true };
             _txtPin = new TextBox
             {
-                Text = "2580",
+                Text = _savedAccessKey,
                 Location = new Point(135, 57),
                 Width = 72,
                 BackColor = Color.FromArgb(30, 35, 50),
@@ -726,11 +739,27 @@ namespace TurboHost
                 BorderStyle = BorderStyle.FixedSingle
             };
 
+            // A key edited while the server runs is applied once typing pauses: Internet access turns off for a
+            // weak key and back on for a strong one, without passing through every half-typed key.
+            _keyApplyTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            _keyApplyTimer.Tick += (s, e) =>
+            {
+                _keyApplyTimer.Stop();
+                ApplyAccessKeyToInternetAccess();
+            };
+            _txtPin.TextChanged += (s, e) =>
+            {
+                if (!_isRunning) return;
+                _keyApplyTimer.Stop();
+                _keyApplyTimer.Start();
+            };
+
             Button btnGenKey = CreateButton("🎲", 210, 56, 28, 25, Color.FromArgb(65, 85, 130));
             btnGenKey.Click += (s, e) =>
             {
                 _txtPin.Text = TurboProtocol.GenerateStrongAccessKey();
                 Log("[Security] Generated new cryptographic access key: " + _txtPin.Text);
+                RememberAccessKey(_txtPin.Text);
             };
 
             _btnStartStop = CreateButton("▶ Start Host Server", 242, 24, 172, 34, Color.FromArgb(34, 155, 95));
@@ -917,6 +946,10 @@ namespace TurboHost
             string room = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtRoomId.Text.Trim())) : _txtRoomId.Text.Trim();
             string pin = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPin.Text.Trim())) : _txtPin.Text.Trim();
 
+            // The directory is found by Host ID (the machine name) + key: under a weak key anyone could read
+            // this PC's addresses.
+            if (IsInternetRefusedForKey(pin)) return;
+
             int port = 9876;
             int.TryParse(portStr, out port);
             string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
@@ -940,7 +973,7 @@ namespace TurboHost
                 }
                 else
                 {
-                    Log(string.Format("[Cloud Discovery READY] Client can now type Host ID '{0}' and PIN '{1}' from anywhere on the Internet!", room, pin));
+                    Log(string.Format("[Cloud Discovery READY] Client can now type Host ID '{0}' and access key '{1}' from anywhere on the Internet!", room, pin));
                 }
             }
             else
@@ -949,11 +982,87 @@ namespace TurboHost
             }
         }
 
+        /// <summary>
+        /// True when <paramref name="key"/> must not face the Internet (no tunnel, no cloud publish). Logs why
+        /// once per key. Safe from any thread.
+        /// </summary>
+        private bool IsInternetRefusedForKey(string key)
+        {
+            string weakness = AccessKeyStore.WhyTooWeakForInternet(key);
+            if (weakness == null)
+            {
+                _lastRefusedKey = null;
+                return false;
+            }
+            if (_lastRefusedKey != key)
+            {
+                _lastRefusedKey = key;
+                Log("[Security] Internet access is OFF: the access key is too weak to expose to the Internet (" + weakness + "). " +
+                    "LAN and direct connections still work. Click 🎲 for a random key, or type one with " + AccessKeyStore.MinInternetKeyLength +
+                    "+ characters; Internet access then turns on by itself.");
+            }
+            return true;
+        }
+
+        /// <summary>Stores a key the user chose in the Host UI for the next start; --pin keys are for one run only.</summary>
+        private void RememberAccessKey(string key)
+        {
+            key = (key ?? "").Trim();
+            if (key.Length == 0 || key == _savedAccessKey || key == _commandLineKey) return;
+            if (AccessKeyStore.Save(key))
+            {
+                _savedAccessKey = key;
+                Log("[Security] Access key saved for the next start in " + AccessKeyStore.KeyFilePath + ".");
+            }
+        }
+
+        /// <summary>UI thread.</summary>
+        private void ShowListeningStatus(bool internetAllowed)
+        {
+            _lblStatus.Text = "● Server Status: LISTENING ON PORT " + _listenPort +
+                (internetAllowed ? " (LOCAL + INTERNET ACTIVE)" : " (LAN ONLY: ACCESS KEY TOO WEAK FOR INTERNET)");
+        }
+
+        /// <summary>UI thread. Brings the tunnel and cloud directory in line with the key now in the box.</summary>
+        private void ApplyAccessKeyToInternetAccess()
+        {
+            if (!_isRunning) return;
+            string key = _txtPin.Text.Trim();
+            RememberAccessKey(key);
+            bool refused = IsInternetRefusedForKey(key);
+            ShowListeningStatus(!refused);
+            if (refused)
+            {
+                Process tunnel = _tunnelProc;
+                if (tunnel != null)
+                {
+                    try
+                    {
+                        if (!tunnel.HasExited)
+                        {
+                            tunnel.Kill();
+                            Log("[Auto-Tunnel] Public Internet tunnel closed because the new access key is too weak.");
+                        }
+                    }
+                    catch { }
+                }
+                return;
+            }
+            StartBuiltInPublicSshTunnel();
+            Task publish = PublishTicketToCloudDirectoryAsync();
+        }
+
         private void StartBuiltInPublicSshTunnel()
         {
             try
             {
                 if (_tunnelProc != null && !_tunnelProc.HasExited)
+                {
+                    return;
+                }
+
+                // Opening the tunnel exposes the key check to the whole Internet.
+                if (IsInternetRefusedForKey(GetPinThreadSafe()))
                 {
                     return;
                 }
@@ -1029,6 +1138,11 @@ namespace TurboHost
             CancellationTokenSource cts = _serverCts;
             if (_isRunning && cts != null && !cts.IsCancellationRequested)
             {
+                string key;
+                try { key = GetPinThreadSafe(); } catch { return; } // form closing
+                // Closed on purpose for a weak key: it reopens once the key is strong again.
+                if (AccessKeyStore.WhyTooWeakForInternet(key) != null) return;
+
                 Log("[Auto-Tunnel] Tunnel closed; reconnecting in 5 seconds...");
                 CancellationToken token = cts.Token;
                 Task.Run(async () =>
@@ -1099,7 +1213,11 @@ namespace TurboHost
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--port" && i + 1 < args.Length) _txtPort.Text = args[i + 1];
-                if (args[i] == "--pin" && i + 1 < args.Length) _txtPin.Text = args[i + 1];
+                if (args[i] == "--pin" && i + 1 < args.Length)
+                {
+                    _commandLineKey = args[i + 1].Trim();
+                    _txtPin.Text = _commandLineKey;
+                }
                 if (args[i] == "--no-autostart") autoStart = false;
             }
 
@@ -1164,7 +1282,8 @@ namespace TurboHost
             }
             catch { }
 
-            // 3. Automatically start & maintain Public Internet Tunnel (with auto-reconnect watchdog)
+            // 3. Automatically start & maintain Public Internet Tunnel (with auto-reconnect watchdog).
+            //    Refused while the access key is too weak to face the Internet.
             StartBuiltInPublicSshTunnel();
 
             // 4. Every 4 minutes, re-publish the Cloud Rendezvous ticket if it changed (new LAN IP, PIN or Host ID)
@@ -1213,10 +1332,13 @@ namespace TurboHost
                 _isRunning = true;
                 _btnStartStop.Text = "⏹ Stop Host Server";
                 _btnStartStop.BackColor = Color.FromArgb(185, 55, 55);
-                _lblStatus.Text = "● Server Status: LISTENING ON PORT " + port + " (LOCAL + INTERNET ACTIVE)";
+                _listenPort = port;
                 _lblStatus.ForeColor = Color.FromArgb(95, 245, 155);
 
-                Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, PIN: {2})", port, _txtRoomId.Text, _txtPin.Text));
+                Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, access key: {2})", port, _txtRoomId.Text, _txtPin.Text));
+                RememberAccessKey(_txtPin.Text);
+                _lastRefusedKey = null; // say again on every start why Internet access is off
+                ShowListeningStatus(!IsInternetRefusedForKey(_txtPin.Text.Trim()));
 
                 // Automatically open Firewall, map UPnP router port, launch Public Internet Tunnel, and publish to Cloud.
                 // Pass THIS server's token so a quick Stop + Start cannot leave two publish loops running.
@@ -1302,9 +1424,12 @@ namespace TurboHost
             // Split(':') turned every IPv6 peer ("[2001:db8::1]:5000") into "[", sharing one lockout bucket.
             IPEndPoint remoteIpEp = client.Client.RemoteEndPoint as IPEndPoint;
             string remoteIpOnly = remoteIpEp != null ? remoteIpEp.Address.ToString() : remoteEp;
+            // Every Internet client arrives from 127.0.0.1 through the tunnel's ssh.exe, so a loopback address
+            // says nothing about who is connecting: a per-IP lockout there locked out all Internet users at once.
+            bool sharedAddress = remoteIpEp != null && SharedAddressThrottle.IsSharedAddress(remoteIpEp.Address);
 
             int lockoutRemaining;
-            if (BruteForceProtector.IsIpLockedOut(remoteIpOnly, out lockoutRemaining))
+            if (!sharedAddress && BruteForceProtector.IsIpLockedOut(remoteIpOnly, out lockoutRemaining))
             {
                 Log(string.Format("[Security BLOCKED] IP {0} is locked out for {1}s due to failed attempts.", remoteIpOnly, lockoutRemaining));
                 try { client.Close(); } catch { }
@@ -1345,19 +1470,59 @@ namespace TurboHost
                         return;
                     }
 
-                    string expectedPin = GetPinThreadSafe();
-                    using (SecurityContext sec = new SecurityContext(expectedPin, salt16, challenge16))
+                    SharedAddressThrottle.Turn turn = null;
+                    if (sharedAddress)
                     {
-                        byte[] expectedClientProof = sec.ComputeHandshakeProof(challenge16, "CLIENT_AUTH_V2");
-                        if (!TurboProtocol.ConstantTimeEquals(authPacket.Value.Value, expectedClientProof))
+                        turn = await SharedAddressThrottle.WaitForTurnAsync(ct);
+                        if (turn == null)
                         {
-                            int fails = BruteForceProtector.RecordFailedAttempt(remoteIpOnly);
-                            await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes("FAIL:Invalid Access Key/PIN (Attempt " + fails + "/5)"), ct);
-                            Log(string.Format("[Security ALERT] Rejected invalid HMAC proof from {0} (Fail #{1}/5)", remoteEp, fails));
+                            await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes("FAIL:Host is busy checking other sign-ins from the Internet. Try again in a minute."), ct);
+                            Log("[Security] Too many sign-ins waiting via loopback/Internet tunnel; turned away " + remoteEp + ".");
+                            return;
+                        }
+                    }
+
+                    SecurityContext sec = null;
+                    bool keyIsRight = false;
+                    try
+                    {
+                        sec = new SecurityContext(GetPinThreadSafe(), salt16, challenge16);
+                        byte[] expectedClientProof = sec.ComputeHandshakeProof(challenge16, "CLIENT_AUTH_V2");
+                        keyIsRight = TurboProtocol.ConstantTimeEquals(authPacket.Value.Value, expectedClientProof);
+                        if (turn != null) turn.RecordResult(keyIsRight);
+                    }
+                    catch
+                    {
+                        if (sec != null) sec.Dispose();
+                        throw;
+                    }
+                    finally
+                    {
+                        // Hand the turn on now, not after the (possibly hours-long) session.
+                        if (turn != null) turn.Dispose();
+                    }
+
+                    using (sec)
+                    {
+                        if (!keyIsRight)
+                        {
+                            if (sharedAddress)
+                            {
+                                int streak = SharedAddressThrottle.FailureStreak;
+                                await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes("FAIL:Invalid Access Key/PIN"), ct);
+                                Log(string.Format("[Security ALERT] Rejected wrong access key from {0} via loopback/Internet tunnel ({1} wrong in a row; next key check waits {2}s; nobody is locked out)",
+                                    remoteEp, streak, (int)SharedAddressThrottle.DelayAfterFailures(streak).TotalSeconds));
+                            }
+                            else
+                            {
+                                int fails = BruteForceProtector.RecordFailedAttempt(remoteIpOnly);
+                                await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes("FAIL:Invalid Access Key/PIN (Attempt " + fails + "/5)"), ct);
+                                Log(string.Format("[Security ALERT] Rejected invalid HMAC proof from {0} (Fail #{1}/5)", remoteEp, fails));
+                            }
                             return;
                         }
 
-                        BruteForceProtector.ResetAttempts(remoteIpOnly);
+                        if (!sharedAddress) BruteForceProtector.ResetAttempts(remoteIpOnly);
 
                         // 3. Send AES-256 + HMAC-SHA256 Encrypted AuthResult back to Client
                         string machineInfo = string.Format("OK|{0}|{1}|{2}|AES-256-HMAC-SHA256", Environment.MachineName, NativeInputInjector.IsRunningAsAdmin() ? "ADMIN" : "USER", Screen.AllScreens.Length);
@@ -1395,6 +1560,7 @@ namespace TurboHost
         {
             // Stop first so the tunnel watchdog does not schedule a restart when the tunnel is killed below.
             _isRunning = false;
+            try { _keyApplyTimer.Dispose(); } catch { }
             try { if (_serverCts != null) _serverCts.Cancel(); } catch { }
             try { if (_listener != null) _listener.Stop(); } catch { }
             // The ssh.exe tunnel used to outlive TurboRemote as an orphan process, keeping the public relay open.

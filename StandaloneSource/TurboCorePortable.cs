@@ -254,6 +254,10 @@ namespace TurboCore
         }
     }
 
+    /// <summary>
+    /// Per-IP lockout (5 wrong keys, then 5 minutes) for peers whose address identifies them: LAN, Tailscale
+    /// and direct WAN. Loopback peers all share one address and go through <see cref="SharedAddressThrottle"/>.
+    /// </summary>
     public static class BruteForceProtector
     {
         private class AttemptRecord
@@ -306,6 +310,207 @@ namespace TurboCore
         {
             AttemptRecord removed;
             _records.TryRemove(ip, out removed);
+        }
+    }
+
+    /// <summary>
+    /// Sign-in throttle for peers that connect from a loopback address. Every Internet client arrives through
+    /// the pinggy tunnel, whose ssh.exe forwards to 127.0.0.1, so they all share that address. The per-IP
+    /// lockout let anyone on the Internet lock every Internet user out with 5 wrong keys, and did nothing
+    /// against a single attacker. This throttle never locks anyone out. It checks one key at a time and, while
+    /// wrong keys keep coming, spaces the checks out (1, 2, 4, 8, 16, then 30 s), so everyone on the Internet
+    /// together gets at most one guess per 30 s. A right key is still accepted at its turn and clears the
+    /// slowdown, and 10 minutes without a wrong key clear it too.
+    /// </summary>
+    public static class SharedAddressThrottle
+    {
+        public const int FreeFailures = 2;
+        public const int MaxDelaySeconds = 30;
+        /// <summary>Connections waiting for a key check at once; more are turned away as "busy".</summary>
+        public const int MaxWaiting = 16;
+        private static readonly TimeSpan QuietReset = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan MaxTurnWait = TimeSpan.FromSeconds(60);
+
+        private static readonly SemaphoreSlim _turnGate = new SemaphoreSlim(1, 1);
+        private static readonly object _sync = new object();
+        private static int _waiting;
+        private static int _failureStreak;
+        private static DateTime _lastFailureUtc = DateTime.MinValue;
+        private static DateTime _nextCheckUtc = DateTime.MinValue;
+
+        /// <summary>One connection's turn to have its key checked. Dispose it as soon as the check is done.</summary>
+        public sealed class Turn : IDisposable
+        {
+            private bool? _keyWasRight;
+            private int _disposed;
+
+            internal Turn() { }
+
+            public void RecordResult(bool keyWasRight)
+            {
+                _keyWasRight = keyWasRight;
+            }
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0) EndTurn(_keyWasRight);
+            }
+        }
+
+        public static bool IsSharedAddress(IPAddress address)
+        {
+            return address != null && IPAddress.IsLoopback(address);
+        }
+
+        /// <summary>Pause before the next key check after this many wrong keys in a row.</summary>
+        public static TimeSpan DelayAfterFailures(int failures)
+        {
+            if (failures <= FreeFailures) return TimeSpan.Zero;
+            int doublings = failures - FreeFailures - 1;
+            if (doublings >= 5) return TimeSpan.FromSeconds(MaxDelaySeconds);
+            return TimeSpan.FromSeconds(Math.Min(MaxDelaySeconds, 1 << doublings));
+        }
+
+        public static int FailureStreak
+        {
+            get { lock (_sync) { ForgetIfQuiet(); return _failureStreak; } }
+        }
+
+        /// <summary>
+        /// Waits until this connection may have its key checked. Returns null, without checking anything, when
+        /// the Host is busy: more than <see cref="MaxWaiting"/> connections are waiting, or no turn came in 60 s.
+        /// </summary>
+        public static async Task<Turn> WaitForTurnAsync(CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref _waiting) > MaxWaiting)
+            {
+                Interlocked.Decrement(ref _waiting);
+                return null;
+            }
+
+            bool entered = false;
+            try
+            {
+                entered = await _turnGate.WaitAsync(MaxTurnWait, ct);
+                if (!entered) return null;
+
+                TimeSpan pause;
+                lock (_sync)
+                {
+                    ForgetIfQuiet();
+                    pause = _nextCheckUtc - DateTime.UtcNow;
+                }
+                if (pause > TimeSpan.Zero) await Task.Delay(pause, ct);
+                return new Turn();
+            }
+            catch
+            {
+                if (entered) _turnGate.Release();
+                throw;
+            }
+            finally
+            {
+                // From here on the turn is held, not waited for; EndTurn releases it.
+                Interlocked.Decrement(ref _waiting);
+            }
+        }
+
+        private static void EndTurn(bool? keyWasRight)
+        {
+            lock (_sync)
+            {
+                if (keyWasRight == true)
+                {
+                    _failureStreak = 0;
+                    _nextCheckUtc = DateTime.MinValue;
+                }
+                else if (keyWasRight == false)
+                {
+                    ForgetIfQuiet();
+                    _failureStreak++;
+                    _lastFailureUtc = DateTime.UtcNow;
+                    _nextCheckUtc = _lastFailureUtc + DelayAfterFailures(_failureStreak);
+                }
+            }
+            _turnGate.Release();
+        }
+
+        private static void ForgetIfQuiet()
+        {
+            if (_failureStreak > 0 && DateTime.UtcNow - _lastFailureUtc > QuietReset)
+            {
+                _failureStreak = 0;
+                _nextCheckUtc = DateTime.MinValue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The Host's access key. The old fixed default PIN 2580 faced the whole Internet once the tunnel worked,
+    /// so each Windows user now gets a random key on first run, kept for later runs.
+    /// </summary>
+    public static class AccessKeyStore
+    {
+        public const string LegacyDefaultPin = "2580";
+        public const int MinInternetKeyLength = 8;
+
+        public static string KeyFilePath
+        {
+            get
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
+                return Path.Combine(dir, "access_key.txt");
+            }
+        }
+
+        /// <summary>
+        /// Returns the saved key, or makes and saves a new one. <paramref name="note"/> is null when a saved key
+        /// was loaded, otherwise a log line saying what happened.
+        /// </summary>
+        public static string LoadOrCreate(out string note)
+        {
+            note = null;
+            try
+            {
+                if (File.Exists(KeyFilePath))
+                {
+                    string saved = File.ReadAllText(KeyFilePath).Trim();
+                    if (saved.Length > 0) return saved;
+                }
+            }
+            catch { }
+
+            string key = TurboProtocol.GenerateStrongAccessKey();
+            note = Save(key)
+                ? "[Security] First run: generated this PC's random access key " + key + " and saved it in " + KeyFilePath + "."
+                : "[Security] Generated random access key " + key + " for this run, but could not save it in " + KeyFilePath + ".";
+            return key;
+        }
+
+        public static bool Save(string key)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(KeyFilePath));
+                File.WriteAllText(KeyFilePath, (key ?? "").Trim());
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Null when the key may face the Internet; otherwise why it may not.</summary>
+        public static string WhyTooWeakForInternet(string key)
+        {
+            string k = (key ?? "").Trim();
+            if (k.Length == 0) return "it is empty";
+            if (k == LegacyDefaultPin) return "it is the old default PIN " + LegacyDefaultPin + ", which anyone can guess";
+            string core = new string(k.Where(c => c != '-' && !char.IsWhiteSpace(c)).ToArray());
+            if (core.Length < MinInternetKeyLength) return "it has fewer than " + MinInternetKeyLength + " characters";
+            if (core.Distinct().Count() < 4) return "it uses fewer than 4 different characters";
+            return null;
         }
     }
 
@@ -1108,41 +1313,56 @@ namespace TurboCore
         public const int DiscoveryUdpPort = 9878;
         private const int CloudLookupTimeoutMs = 8000;
 
-        private static string DeriveRendezvousUrl(string roomCode, string pin)
+        private const int CloudKdfIterations = 100000;
+        private const string TicketPrefix = "TRBO_TICKET_V2:";
+
+        /// <summary>
+        /// Derives the ntfy topic URL and the ticket encryption secret from Host ID + access key. V1 used one
+        /// plain SHA-256 for the topic, so whoever saw the topic name (ntfy.sh itself, a log) could test billions
+        /// of keys a second offline. PBKDF2 salted with the Host ID makes every guess cost 100,000 rounds.
+        /// </summary>
+        public static void DeriveCloudDirectory(string roomCode, string pin, out string topicUrl, out string ticketSecret)
         {
-            using (SHA256 sha = SHA256.Create())
+            byte[] salt = Encoding.UTF8.GetBytes("TURBOREMOTE_CLOUD_DIRECTORY_V2::" + roomCode.Trim().ToUpperInvariant());
+            using (Rfc2898DeriveBytes kdf = new Rfc2898DeriveBytes(pin.Trim(), salt, CloudKdfIterations, HashAlgorithmName.SHA256))
             {
-                byte[] raw = Encoding.UTF8.GetBytes("TURBOREMOTE_CLOUD_DIRECTORY_V1::" + roomCode.Trim().ToUpperInvariant() + "::" + pin.Trim());
-                byte[] hash = sha.ComputeHash(raw);
-                StringBuilder hex = new StringBuilder(32);
-                for (int i = 0; i < 16; i++) hex.Append(hash[i].ToString("x2"));
-                return "https://ntfy.sh/trbo_" + hex.ToString();
+                byte[] block = kdf.GetBytes(32);
+                // The topic is public to ntfy.sh; the other half never leaves this PC.
+                topicUrl = "https://ntfy.sh/trbo2_" + ToHex(block, 0, 16);
+                ticketSecret = ToHex(block, 16, 16);
             }
         }
 
-        public static string EncryptTicketForCloud(string plainTicket, string pin)
+        private static string ToHex(byte[] bytes, int offset, int count)
+        {
+            StringBuilder hex = new StringBuilder(count * 2);
+            for (int i = offset; i < offset + count; i++) hex.Append(bytes[i].ToString("x2"));
+            return hex.ToString();
+        }
+
+        public static string EncryptTicketForCloud(string plainTicket, string ticketSecret)
         {
             byte[] salt = Encoding.UTF8.GetBytes("TRBO_CLOUD_SALT!");
             byte[] chal = Encoding.UTF8.GetBytes("TRBO_CLOUD_CHAL!");
-            using (SecurityContext sec = new SecurityContext(pin, salt, chal))
+            using (SecurityContext sec = new SecurityContext(ticketSecret, salt, chal))
             {
                 byte[] enc = sec.EncryptAndAuthenticate(PacketType.AuthChallenge, Encoding.UTF8.GetBytes(plainTicket));
-                return "TRBO_TICKET_V1:" + Convert.ToBase64String(enc);
+                return TicketPrefix + Convert.ToBase64String(enc);
             }
         }
 
-        public static string DecryptTicketFromCloud(string line, string pin)
+        public static string DecryptTicketFromCloud(string line, string ticketSecret)
         {
-            int idx = line.IndexOf("TRBO_TICKET_V1:");
+            int idx = line.IndexOf(TicketPrefix);
             if (idx < 0) return null;
-            string b64 = line.Substring(idx + "TRBO_TICKET_V1:".Length).Trim();
+            string b64 = line.Substring(idx + TicketPrefix.Length).Trim();
             int quoteIdx = b64.IndexOf('"');
             if (quoteIdx > 0) b64 = b64.Substring(0, quoteIdx);
 
             byte[] env = Convert.FromBase64String(b64);
             byte[] salt = Encoding.UTF8.GetBytes("TRBO_CLOUD_SALT!");
             byte[] chal = Encoding.UTF8.GetBytes("TRBO_CLOUD_CHAL!");
-            using (SecurityContext sec = new SecurityContext(pin, salt, chal))
+            using (SecurityContext sec = new SecurityContext(ticketSecret, salt, chal))
             {
                 byte[] plain = sec.VerifyAndDecrypt(PacketType.AuthChallenge, env);
                 return Encoding.UTF8.GetString(plain);
@@ -1154,9 +1374,14 @@ namespace TurboCore
         {
             try
             {
+                // Callers already refuse weak keys; this is the last line before the endpoints leave the PC.
+                string weakness = AccessKeyStore.WhyTooWeakForInternet(pin);
+                if (weakness != null) return "the access key is too weak to publish (" + weakness + ")";
+
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                string url = DeriveRendezvousUrl(roomCode, pin);
-                string encryptedPayload = EncryptTicketForCloud(ticket, pin);
+                string url, ticketSecret;
+                DeriveCloudDirectory(roomCode, pin, out url, out ticketSecret);
+                string encryptedPayload = EncryptTicketForCloud(ticket, ticketSecret);
 
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.Method = "POST";
@@ -1191,8 +1416,13 @@ namespace TurboCore
             {
                 try
                 {
+                    // A Host never publishes under a weak key, so there is nothing to find.
+                    if (AccessKeyStore.WhyTooWeakForInternet(pin) != null) return (string)null;
+
                     ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                    string url = DeriveRendezvousUrl(roomCode, pin) + "/raw?poll=1&since=12h";
+                    string topicUrl, ticketSecret;
+                    DeriveCloudDirectory(roomCode, pin, out topicUrl, out ticketSecret);
+                    string url = topicUrl + "/raw?poll=1&since=12h";
 
                     HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                     req.Method = "GET";
@@ -1208,7 +1438,7 @@ namespace TurboCore
                         {
                             try
                             {
-                                string decrypted = DecryptTicketFromCloud(lines[i], pin);
+                                string decrypted = DecryptTicketFromCloud(lines[i], ticketSecret);
                                 if (!string.IsNullOrWhiteSpace(decrypted))
                                 {
                                     return decrypted;

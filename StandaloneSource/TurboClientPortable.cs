@@ -140,9 +140,10 @@ namespace TurboClient
             };
 
             Label lblPin = new Label { Text = "PIN:", Location = new Point(374, 13), AutoSize = true };
+            // Each Host has its own random access key now; there is no shared default to pre-fill.
             _txtPin = new TextBox
             {
-                Text = "2580",
+                Text = "",
                 Location = new Point(406, 10),
                 Width = 65,
                 BackColor = Color.FromArgb(16, 18, 26),
@@ -452,6 +453,11 @@ namespace TurboClient
             if (!int.TryParse(_txtPort.Text.Trim(), out port))
             {
                 MessageBox.Show("Invalid TCP port number.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (_txtPin.Text.Trim().Length == 0)
+            {
+                MessageBox.Show("Enter the Host's access key (shown in the Host window next to 'Access Key/PIN').", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 

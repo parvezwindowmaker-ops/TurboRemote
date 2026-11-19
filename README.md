@@ -29,10 +29,12 @@ Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both *
    - **Automatically opens Windows Firewall** (when running as Admin).
    - **Automatically maps UPnP on your router** for port `9876`.
    - **Automatically starts and maintains the Public Internet Tunnel** (`tcp://xxxx.run.pinggy-free.link:PORT`) in the background with an auto-reconnect watchdog if the tunnel ever drops. The free tunnel's address changes every 60 minutes; the Host reconnects and re-publishes it on its own.
-   - **Automatically publishes your encrypted endpoints** under your **Host ID** whenever they change (new tunnel address, IP, PIN or Host ID) and refreshes them every 3 hours, so you can connect from anywhere on the Internet at any time.
-2. **Set or Generate Your Access Key / PIN**:
-   - The default PIN is **`2580`**.
-   - Click the **`🎲`** button next to the PIN box to generate a random cryptographic Access Key (e.g., `K9X4-M7P2`).
+   - **Automatically publishes your encrypted endpoints** under your **Host ID** whenever they change (new tunnel address, IP, access key or Host ID) and refreshes them every 3 hours, so you can connect from anywhere on the Internet at any time.
+   - The tunnel and the Host ID publishing only run while the access key is strong enough for the Internet (see step 2).
+2. **Your Access Key**:
+   - There is no shared default PIN any more. On first run the Host generates a random access key (e.g., `K9X4-M7P2`) and saves it for your Windows user in `%LOCALAPPDATA%\TurboRemote\access_key.txt`, so it stays the same on every start. Give this key to whoever connects.
+   - Click the **`🎲`** button next to the key box for a new random key. A key you generate or type in the Host window is saved for the next start (a key passed with `--pin` is used for that run only).
+   - **Internet access needs a strong key**: at least 8 characters (dashes and spaces don't count) with at least 4 different characters. With a weaker key, such as the old `2580`, the Host stays LAN-only: it opens no Internet tunnel, publishes nothing under its Host ID, and the log says why. Change the key while the server runs and Internet access turns on or off by itself.
 3. **Grant Full Administrator Permissions (Recommended)**:
    - Click **`🛡 Elevate to Admin (UAC)`** so you can remotely control elevated windows, Task Manager, UAC prompts, and lock the remote keyboard/mouse.
 4. **Optional — Auto-Start When Windows Boots**:
@@ -49,7 +51,7 @@ Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both *
 2. In the **Smart Route / IP** box, either:
    - Leave it as **`AUTO`** (automatically discovers the Host on your local network via UDP broadcast), **OR**
    - Type the Host's **Machine Name** (e.g., `WM-DEV-07`) or **Local IP** (e.g., `192.168.1.56`).
-3. Enter the **PIN** (`2580`) and click **`⚡ Connect to Host`**.
+3. Enter the Host's **access key** (shown in the Host window, e.g. `K9X4-M7P2`) in the **PIN** box and click **`⚡ Connect to Host`**.
    -*(If you ever make a typo or want to abort while connecting, click the orange **`✖ Stop / Cancel`** button to cancel immediately.)*
 
 ---
@@ -63,10 +65,11 @@ Choose whichever of these **3 Internet methods** is easiest for your setup:
    - This uses Windows' built-in OpenSSH Client (`ssh.exe`) in the background to open a public TCP relay (`tcp://xxxx.run.pinggy-free.link:PORT`). On first use it creates its own sign-in key in `%LOCALAPPDATA%\TurboRemote\tunnel_ed25519`. If the log says `ssh.exe` could not be started, add the **OpenSSH Client** optional feature in Windows Settings.
    - Within 3–5 seconds, the Host log will show:
      `[PUBLIC INTERNET TUNNEL ACTIVE] -> xxxx.run.pinggy-free.link:12345`
-     `[Cloud Discovery READY] Client can now type Host ID 'YOUR-PC-NAME' and PIN '2580' from anywhere on the Internet!`
+     `[Cloud Discovery READY] Client can now type Host ID 'YOUR-PC-NAME' and access key 'K9X4-M7P2' from anywhere on the Internet!`
+   - If the log instead says `Internet access is OFF: the access key is too weak...`, click **`🎲`** (or type a stronger key) and the tunnel starts by itself.
 2. **On the Client PC**:
    - Type the Host's **Host ID** (e.g., `WM-DEV-07`) **or** the tunnel address (`xxxx.run.pinggy-free.link:12345`) into **Smart Route / IP**.
-   - Enter the **PIN** and click **`⚡ Connect to Host`**.
+   - Enter the Host's **access key** and click **`⚡ Connect to Host`**. Finding a Host by its Host ID needs this TurboRemote version (or newer) on both PCs.
    - *Smart Routing Bonus:* If you type the **Host ID** or paste the **Smart Ticket** (`⚡ Copy / Publish ID`), the Client automatically tests Local LAN first and falls back to the Internet Tunnel if you are away from the office!
 
 #### Method 2: Tailscale / ZeroTier Direct P2P (Fastest Internet Speed & Lowest Ping)
@@ -116,7 +119,12 @@ You can switch profiles live during a session from the **Profile** dropdown:
 
 - **Zero-Knowledge Challenge-Response Handshake**: Your PIN/Access Key is **never** sent over the network. The Host sends a 32-byte random salt + challenge, and both sides derive a 512-bit key using **PBKDF2-SHA256 (`15,000 iterations`)**.
 - **AES-256-CBC + Encrypt-Then-MAC (`HMAC-SHA256`)**: Every screen frame, mouse click, keystroke, PowerShell output, and file chunk is encrypted with AES-256 (fresh CSPRNG IV per packet) and verified with HMAC-SHA256.
-- **Anti-Replay & Brute-Force Lockout**: Every packet embeds an authenticated 64-bit sequence counter to block replay attacks, and any IP that fails authentication 5 times is automatically locked out for 5 minutes.
+- **Anti-Replay**: Every packet embeds an authenticated 64-bit sequence counter to block replay attacks.
+- **Brute-Force Protection**:
+  - LAN, Tailscale and direct connections: any IP that enters a wrong key 5 times is locked out for 5 minutes.
+  - Internet tunnel (and anything else arriving from `127.0.0.1`): every tunnel user shares the address `127.0.0.1`, so nobody is locked out by address. Instead keys are checked one at a time, and after repeated wrong keys the checks are spaced out (1, 2, 4, 8, 16, then 30 seconds), so the whole Internet together gets at most one guess every 30 seconds. A user with the right key still gets in at their turn, which clears the slowdown; 10 quiet minutes clear it too. While someone floods the tunnel with sign-ins, others may see "Host is busy" and need to retry.
+- **Strong Keys for the Internet**: Every Host gets its own random access key; a weak key keeps the Host off the Internet (see Section 2).
+- **Private Host ID Directory**: The cloud directory entry is found and encrypted with a key derived from Host ID + access key through PBKDF2-SHA256 (`100,000 iterations`), so neither the directory service nor anyone else can test access keys quickly offline.
 
 ---
 
@@ -125,12 +133,15 @@ You can switch profiles live during a session from the **Profile** dropdown:
 You can also launch `TurboRemote.exe` directly via command line or batch scripts:
 
 ```powershell
-# Start directly in Host Server mode on port 9876 with PIN 2580:
-.\TurboRemote.exe --host --port 9876 --pin 2580
+# Start directly in Host Server mode on port 9876 with this user's saved access key:
+.\TurboRemote.exe --host --port 9876
+
+# ...or with a specific access key for this run only:
+.\TurboRemote.exe --host --port 9876 --pin K9X4-M7P2
 
 # Start directly in Viewer Client mode and auto-connect to a Host:
-.\TurboRemote.exe --client --connect WM-DEV-07 --port 9876 --pin 2580
+.\TurboRemote.exe --client --connect WM-DEV-07 --port 9876 --pin K9X4-M7P2
 
-# Run the built-in automated diagnostic self-test (Screen Capture + AES-256 E2EE check):
+# Run the built-in automated diagnostic self-test (Screen Capture + AES-256 E2EE + Internet hardening checks):
 .\TurboRemote.exe --self-test
 ```

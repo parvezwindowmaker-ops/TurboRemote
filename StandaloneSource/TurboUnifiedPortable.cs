@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net;
 using System.Threading;
 using System.Windows.Forms;
 using TurboClient;
@@ -96,8 +97,11 @@ namespace TurboUnified
             btnBothDemo.Click += (s, e) =>
             {
                 string exe = Process.GetCurrentProcess().MainModule.FileName;
-                Process.Start(exe, "--host --port 9876 --pin 2580");
-                Process.Start(exe, "--client --connect 127.0.0.1 --port 9876 --pin 2580");
+                // This PC's own saved access key, not the old fixed PIN 2580 the whole Internet could guess.
+                string keyNote;
+                string key = AccessKeyStore.LoadOrCreate(out keyNote);
+                Process.Start(exe, "--host --port 9876 --pin \"" + key + "\"");
+                Process.Start(exe, "--client --connect 127.0.0.1 --port 9876 --pin \"" + key + "\"");
                 Close();
             };
 
@@ -129,7 +133,7 @@ namespace TurboUnified
 
             string host = null;
             int port = 9876;
-            string pin = "2580";
+            string pin = "";
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -233,7 +237,34 @@ namespace TurboUnified
                             throw new Exception("Session 1 framing failed.");
                     }
 
-                    Console.WriteLine(string.Format("SELF_TEST_PASSED|Resolution={0}x{1}|KeyFrameTiles={2}|CompressedBytes={3}|Encryption=AES-256-HMAC-SHA256|ReconnectLifecycle=OK", nw, nh, tiles, frame1.Length));
+                    // 4. Internet hardening: weak keys stay off the Internet, loopback peers are throttled
+                    //    (never locked out), and the cloud directory round-trips under the hardened V2 derivation.
+                    string strongKey = TurboProtocol.GenerateStrongAccessKey();
+                    if (AccessKeyStore.WhyTooWeakForInternet("2580") == null || AccessKeyStore.WhyTooWeakForInternet("aaaa-aaaa") == null ||
+                        AccessKeyStore.WhyTooWeakForInternet("") == null || AccessKeyStore.WhyTooWeakForInternet(strongKey) != null)
+                        throw new Exception("Access key strength policy wrong.");
+                    if (!SharedAddressThrottle.IsSharedAddress(IPAddress.Loopback) || SharedAddressThrottle.IsSharedAddress(IPAddress.Parse("192.168.1.5")))
+                        throw new Exception("Loopback/LAN classification wrong.");
+                    int[] expectedDelays = { 0, 0, 0, 1, 2, 4, 8, 16, 30, 30 };
+                    for (int f = 0; f < expectedDelays.Length; f++)
+                    {
+                        if ((int)SharedAddressThrottle.DelayAfterFailures(f).TotalSeconds != expectedDelays[f])
+                            throw new Exception("Loopback throttle delay after " + f + " failures is wrong.");
+                    }
+                    string topic, secret, otherTopic, otherSecret;
+                    SmartRouteEngine.DeriveCloudDirectory("wm-dev-07 ", strongKey, out topic, out secret);
+                    SmartRouteEngine.DeriveCloudDirectory("WM-DEV-07", strongKey + "X", out otherTopic, out otherSecret);
+                    if (!topic.StartsWith("https://ntfy.sh/trbo2_") || topic == otherTopic || secret == otherSecret || topic.Contains(secret))
+                        throw new Exception("Cloud directory derivation wrong.");
+                    string sealedTicket = SmartRouteEngine.EncryptTicketForCloud("192.168.1.5:9876,abc.run.pinggy-free.link:4321", secret);
+                    if (SmartRouteEngine.DecryptTicketFromCloud(sealedTicket, secret) != "192.168.1.5:9876,abc.run.pinggy-free.link:4321")
+                        throw new Exception("Cloud ticket round trip failed.");
+                    bool wrongSecretRejected = false;
+                    try { SmartRouteEngine.DecryptTicketFromCloud(sealedTicket, otherSecret); }
+                    catch (System.Security.Cryptography.CryptographicException) { wrongSecretRejected = true; }
+                    if (!wrongSecretRejected) throw new Exception("Cloud ticket opened with the wrong key.");
+
+                    Console.WriteLine(string.Format("SELF_TEST_PASSED|Resolution={0}x{1}|KeyFrameTiles={2}|CompressedBytes={3}|Encryption=AES-256-HMAC-SHA256|ReconnectLifecycle=OK|InternetHardening=OK", nw, nh, tiles, frame1.Length));
                     Environment.Exit(0);
                 }
             }
