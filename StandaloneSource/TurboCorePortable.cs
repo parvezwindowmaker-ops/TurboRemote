@@ -1106,6 +1106,7 @@ namespace TurboCore
     public static class SmartRouteEngine
     {
         public const int DiscoveryUdpPort = 9878;
+        private const int CloudLookupTimeoutMs = 8000;
 
         private static string DeriveRendezvousUrl(string roomCode, string pin)
         {
@@ -1148,7 +1149,8 @@ namespace TurboCore
             }
         }
 
-        public static async Task<bool> PublishHostTicketToCloudAsync(string roomCode, string pin, string ticket)
+        /// <summary>Returns null on success, otherwise why the publish failed.</summary>
+        public static async Task<string> PublishHostTicketToCloudAsync(string roomCode, string pin, string ticket)
         {
             try
             {
@@ -1158,7 +1160,7 @@ namespace TurboCore
 
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.Method = "POST";
-                req.Timeout = 6000;
+                req.Timeout = 10000;
                 byte[] data = Encoding.UTF8.GetBytes(encryptedPayload);
                 req.ContentLength = data.Length;
                 using (Stream s = await req.GetRequestStreamAsync())
@@ -1167,12 +1169,19 @@ namespace TurboCore
                 }
                 using (WebResponse resp = await req.GetResponseAsync())
                 {
-                    return true;
+                    return null;
                 }
             }
-            catch
+            catch (WebException wex)
             {
-                return false;
+                HttpWebResponse httpResp = wex.Response as HttpWebResponse;
+                if (httpResp != null && (int)httpResp.StatusCode == 429)
+                    return "ntfy.sh daily message limit reached for this public IP (HTTP 429)";
+                return wex.Message;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
             }
         }
 
@@ -1187,8 +1196,9 @@ namespace TurboCore
 
                     HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                     req.Method = "GET";
-                    req.Timeout = 2000;
-                    req.ReadWriteTimeout = 2000;
+                    // DNS + TCP + TLS + the poll took ~0.7 s even on a fast link; 2 s was too tight for slow ones.
+                    req.Timeout = CloudLookupTimeoutMs;
+                    req.ReadWriteTimeout = CloudLookupTimeoutMs;
                     using (WebResponse resp = req.GetResponse())
                     using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
                     {
@@ -1400,6 +1410,17 @@ namespace TurboCore
                 candidates.AddRange(ParseCandidates(rawInput.TrimStart('@'), defaultPort));
             }
 
+            // A Host ID is looked up in the cloud directory right away, so the HTTPS round trip overlaps the
+            // direct attempt below instead of starting after it.
+            bool looksLikeHostId = !string.IsNullOrEmpty(rawInput) &&
+                                   !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
+                                   !rawInput.Contains(".") &&
+                                   !rawInput.Contains(":");
+            string cleanRoom = rawInput.TrimStart('@');
+            Task<string> cloudTask = (looksLikeHostId || rawInput.StartsWith("@"))
+                ? ResolveHostTicketFromCloudAsync(cleanRoom, pin)
+                : null;
+
             // 2. If user typed a single IP or Hostname, try direct fast TCP connect FIRST (700ms fast path!)
             // If the machine is on Local LAN or direct IP, this connects in 2-15ms without waiting for UDP or Cloud!
             if (candidates.Count == 1)
@@ -1440,36 +1461,36 @@ namespace TurboCore
 
             ct.ThrowIfCancellationRequested();
 
-            // 3. Run UDP Local LAN Broadcast Discovery (300ms) + Cloud Rendezvous (1200ms) in parallel
-            Task<List<EndpointCandidate>> lanTask = DiscoverLanHostsAsync(300);
-
-            bool looksLikeHostId = !string.IsNullOrEmpty(rawInput) &&
-                                   !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
-                                   !rawInput.Contains(".") &&
-                                   !rawInput.Contains(":");
-
-            if (looksLikeHostId || rawInput.StartsWith("@"))
+            // 3. UDP Local LAN Broadcast Discovery (300ms), then the Cloud Rendezvous lookup started above
+            List<EndpointCandidate> lanFound = await DiscoverLanHostsAsync(300);
+            ct.ThrowIfCancellationRequested();
+            foreach (EndpointCandidate lan in lanFound)
             {
-                string cleanRoom = rawInput.TrimStart('@');
-                Task<string> cloudTask = ResolveHostTicketFromCloudAsync(cleanRoom, pin);
-                Task completed = await Task.WhenAny(cloudTask, Task.Delay(1200, ct));
-                ct.ThrowIfCancellationRequested();
-                if (completed == cloudTask && !string.IsNullOrWhiteSpace(cloudTask.Result))
+                if (!candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port))
+                {
+                    candidates.Insert(0, lan);
+                }
+            }
+
+            if (cloudTask != null)
+            {
+                // Over the Internet the cloud ticket is the only way to learn the Host's tunnel address. The
+                // lookup used to be abandoned after 1.2 s, before a typical HTTPS poll had even finished, so
+                // Internet connections by Host ID failed. Skip the wait only when the Host answered on the LAN.
+                bool requestedHostOnLan = lanFound.Any(l =>
+                    l.RouteLabel.IndexOf("(" + cleanRoom + ")", StringComparison.OrdinalIgnoreCase) >= 0);
+                if (!requestedHostOnLan && !cloudTask.IsCompleted)
+                {
+                    await Task.WhenAny(cloudTask, Task.Delay(CloudLookupTimeoutMs, ct));
+                    ct.ThrowIfCancellationRequested();
+                }
+                if (cloudTask.IsCompleted && !string.IsNullOrWhiteSpace(cloudTask.Result))
                 {
                     foreach (EndpointCandidate cc in ParseCandidates(cloudTask.Result, defaultPort))
                     {
                         if (!candidates.Any(c => c.Host == cc.Host && c.Port == cc.Port))
                             candidates.Add(cc);
                     }
-                }
-            }
-
-            List<EndpointCandidate> lanFound = await lanTask;
-            foreach (EndpointCandidate lan in lanFound)
-            {
-                if (!candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port))
-                {
-                    candidates.Insert(0, lan);
                 }
             }
 
@@ -1633,6 +1654,114 @@ namespace TurboCore
             {
                 return "UPnP status: " + ex.Message;
             }
+        }
+    }
+
+    /// <summary>
+    /// The pinggy.io SSH reverse tunnel that gives the Host a public Internet address.
+    /// </summary>
+    public static class PublicTunnel
+    {
+        /// <summary>Prefers the Windows OpenSSH client; falls back to whatever is on PATH.</summary>
+        public static string FindOpenSshTool(string exeName)
+        {
+            try
+            {
+                string inbox = Path.Combine(Path.Combine(Environment.SystemDirectory, "OpenSSH"), exeName);
+                if (File.Exists(inbox)) return inbox;
+            }
+            catch { }
+            return exeName;
+        }
+
+        /// <summary>
+        /// pinggy only offers publickey and password sign-in. Without a key, ssh.exe stopped at a password
+        /// prompt that no one could see or answer, so the tunnel never opened. pinggy's free tier accepts
+        /// any key, so make one of our own once and reuse it. Returns the private key path, or null.
+        /// </summary>
+        public static string EnsureTunnelKey(out string error)
+        {
+            error = null;
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
+            string keyPath = Path.Combine(dir, "tunnel_ed25519");
+            try
+            {
+                if (File.Exists(keyPath) && new FileInfo(keyPath).Length > 0) return keyPath;
+
+                Directory.CreateDirectory(dir);
+                // A half-written key from an earlier failed attempt would make ssh-keygen ask "Overwrite (y/n)?".
+                try { File.Delete(keyPath); } catch { }
+                try { File.Delete(keyPath + ".pub"); } catch { }
+
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = FindOpenSshTool("ssh-keygen.exe"),
+                    Arguments = string.Format("-q -t ed25519 -N \"\" -C TurboRemote-tunnel -f \"{0}\"", keyPath),
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process proc = Process.Start(psi))
+                {
+                    proc.StandardInput.Close();
+                    Task<string> stdout = proc.StandardOutput.ReadToEndAsync();
+                    Task<string> stderr = proc.StandardError.ReadToEndAsync();
+                    if (!proc.WaitForExit(15000))
+                    {
+                        try { proc.Kill(); } catch { }
+                        error = "ssh-keygen.exe did not finish within 15 seconds.";
+                        return null;
+                    }
+                    if (proc.ExitCode != 0 || !File.Exists(keyPath))
+                    {
+                        error = ("ssh-keygen.exe failed: " + stderr.Result + " " + stdout.Result).Trim();
+                        return null;
+                    }
+                }
+                return keyPath;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return null;
+            }
+        }
+
+        public static string BuildSshArguments(int localPort, string keyPath)
+        {
+            // -T: no pseudo-terminal. With one, pinggy draws a full-screen UI made of escape codes and no
+            //     newlines, so the address never reached the line-based output reader.
+            // BatchMode: never wait on a prompt; fail fast and let the watchdog retry.
+            // 127.0.0.1: "localhost" resolves to ::1 first, but the Host listens on IPv4 only.
+            return string.Format(
+                "-T -p 443 -R0:127.0.0.1:{0} -i \"{1}\" -o IdentitiesOnly=yes -o BatchMode=yes " +
+                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=15 " +
+                "-o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes tcp@a.pinggy.io",
+                localPort, keyPath);
+        }
+
+        /// <summary>
+        /// Returns "host:port" from a pinggy line such as "tcp://abcd-1-2-3-4.run.pinggy-free.link:35793",
+        /// or null when the line holds no tunnel address.
+        /// </summary>
+        public static string TryParseEndpoint(string line)
+        {
+            if (string.IsNullOrEmpty(line)) return null;
+            int idx = line.IndexOf("tcp://", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+
+            string rest = line.Substring(idx + 6);
+            int end = 0;
+            // Stop at the first character that cannot be part of host:port (space, escape code, box char).
+            while (end < rest.Length && (char.IsLetterOrDigit(rest[end]) || rest[end] == '.' || rest[end] == '-' || rest[end] == ':')) end++;
+            string endpoint = rest.Substring(0, end);
+
+            int colon = endpoint.LastIndexOf(':');
+            int port;
+            if (colon <= 0 || !int.TryParse(endpoint.Substring(colon + 1), out port) || port < 1 || port > 65535) return null;
+            return endpoint;
         }
     }
 }

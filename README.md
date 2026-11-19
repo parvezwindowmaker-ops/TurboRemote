@@ -28,8 +28,8 @@ Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both *
    - Opens TCP port `9876` and UDP LAN Discovery port `9878`.
    - **Automatically opens Windows Firewall** (when running as Admin).
    - **Automatically maps UPnP on your router** for port `9876`.
-   - **Automatically starts and maintains the Public Internet Tunnel** (`tcp://xxxx.pinggy.io:PORT`) in the background with an auto-reconnect watchdog if the tunnel ever drops.
-   - **Automatically publishes and refreshes your encrypted endpoints** under your **Host ID** every 4 minutes so you can connect from anywhere on the Internet at any time.
+   - **Automatically starts and maintains the Public Internet Tunnel** (`tcp://xxxx.run.pinggy-free.link:PORT`) in the background with an auto-reconnect watchdog if the tunnel ever drops. The free tunnel's address changes every 60 minutes; the Host reconnects and re-publishes it on its own.
+   - **Automatically publishes your encrypted endpoints** under your **Host ID** whenever they change (new tunnel address, IP, PIN or Host ID) and refreshes them every 3 hours, so you can connect from anywhere on the Internet at any time.
 2. **Set or Generate Your Access Key / PIN**:
    - The default PIN is **`2580`**.
    - Click the **`🎲`** button next to the PIN box to generate a random cryptographic Access Key (e.g., `K9X4-M7P2`).
@@ -60,12 +60,12 @@ Choose whichever of these **3 Internet methods** is easiest for your setup:
 
 #### Method 1: Built-In Auto Internet Tunnel (Zero Router Setup & Zero VPN Install)
 1. **On the Host PC**: In Box #3, click **`🌍 Auto Internet Tunnel`**.
-   - This uses Windows' built-in OpenSSH (`ssh.exe`) in the background to open a public TCP relay (`tcp://xxxx.pinggy.io:PORT`).
+   - This uses Windows' built-in OpenSSH Client (`ssh.exe`) in the background to open a public TCP relay (`tcp://xxxx.run.pinggy-free.link:PORT`). On first use it creates its own sign-in key in `%LOCALAPPDATA%\TurboRemote\tunnel_ed25519`. If the log says `ssh.exe` could not be started, add the **OpenSSH Client** optional feature in Windows Settings.
    - Within 3–5 seconds, the Host log will show:
-     `[PUBLIC INTERNET TUNNEL ACTIVE] -> xxxx.pinggy.io:12345`
+     `[PUBLIC INTERNET TUNNEL ACTIVE] -> xxxx.run.pinggy-free.link:12345`
      `[Cloud Discovery READY] Client can now type Host ID 'YOUR-PC-NAME' and PIN '2580' from anywhere on the Internet!`
 2. **On the Client PC**:
-   - Type the Host's **Host ID** (e.g., `WM-DEV-07`) **or** the tunnel address (`xxxx.pinggy.io:12345`) into **Smart Route / IP**.
+   - Type the Host's **Host ID** (e.g., `WM-DEV-07`) **or** the tunnel address (`xxxx.run.pinggy-free.link:12345`) into **Smart Route / IP**.
    - Enter the **PIN** and click **`⚡ Connect to Host`**.
    - *Smart Routing Bonus:* If you type the **Host ID** or paste the **Smart Ticket** (`⚡ Copy / Publish ID`), the Client automatically tests Local LAN first and falls back to the Internet Tunnel if you are away from the office!
 

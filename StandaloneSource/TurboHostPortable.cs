@@ -858,7 +858,7 @@ namespace TurboHost
                 string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
                 Clipboard.SetText(ticket);
                 Log("[SmartTicket] Copied endpoints to Clipboard: " + ticket);
-                await PublishTicketToCloudDirectoryAsync();
+                await PublishTicketToCloudDirectoryAsync(true);
             };
 
             Button btnStartPublicTunnel = CreateButton("🌍 Auto Internet Tunnel", 542, 88, 170, 28, Color.FromArgb(30, 130, 115));
@@ -900,8 +900,18 @@ namespace TurboHost
             Controls.Add(grpLog);
         }
 
+        // ntfy.sh allows 250 messages a day per public IP and keeps them for 12 hours. Re-publishing every
+        // 4 minutes (360 a day) hit that limit after ~16 hours; from then on new tunnel addresses (pinggy's
+        // free tunnel changes every 60 minutes) could not be published and Internet clients only found dead
+        // ones. Publish when the ticket changes, plus a keep-alive well inside the 12-hour expiry.
+        private static readonly TimeSpan CloudKeepAliveInterval = TimeSpan.FromHours(3);
+        private string _lastPublishedCloudKey = "";
+        private DateTime _lastCloudPublishUtc = DateTime.MinValue;
+
+        private const string TunnelListSuffix = " (Public Internet Tunnel)";
+
         /// <summary>Safe from any thread: the text boxes are read through Invoke when needed.</summary>
-        private async Task PublishTicketToCloudDirectoryAsync()
+        private async Task PublishTicketToCloudDirectoryAsync(bool force = false)
         {
             string portStr = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim())) : _txtPort.Text.Trim();
             string room = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtRoomId.Text.Trim())) : _txtRoomId.Text.Trim();
@@ -911,16 +921,31 @@ namespace TurboHost
             int.TryParse(portStr, out port);
             string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
 
+            string publishKey = room + "|" + pin + "|" + ticket;
+            if (!force && publishKey == _lastPublishedCloudKey && DateTime.UtcNow - _lastCloudPublishUtc < CloudKeepAliveInterval)
+            {
+                return;
+            }
+
             Log(string.Format("[Cloud Discovery] Publishing AES-256 encrypted endpoints for Host ID '{0}'...", room));
             // Key derivation and the HTTP request (whose DNS lookup is synchronous) run off the UI thread.
-            bool ok = await Task.Run(() => SmartRouteEngine.PublishHostTicketToCloudAsync(room, pin, ticket));
-            if (ok)
+            string error = await Task.Run(() => SmartRouteEngine.PublishHostTicketToCloudAsync(room, pin, ticket));
+            if (error == null)
             {
-                Log(string.Format("[Cloud Discovery READY] Client can now type Host ID '{0}' and PIN '{1}' from anywhere on the Internet!", room, pin));
+                _lastPublishedCloudKey = publishKey;
+                _lastCloudPublishUtc = DateTime.UtcNow;
+                if (string.IsNullOrEmpty(_activePublicTunnelEndpoint))
+                {
+                    Log(string.Format("[Cloud Discovery] Host ID '{0}' published with LAN endpoints only; Internet access is ready once the tunnel is up.", room));
+                }
+                else
+                {
+                    Log(string.Format("[Cloud Discovery READY] Client can now type Host ID '{0}' and PIN '{1}' from anywhere on the Internet!", room, pin));
+                }
             }
             else
             {
-                Log("[Cloud Discovery] Offline/Local mode active (Use LAN AUTO or Smart Ticket).");
+                Log("[Cloud Discovery] Publish failed (" + error + "). LAN AUTO and the Smart Ticket still work.");
             }
         }
 
@@ -933,41 +958,53 @@ namespace TurboHost
                     return;
                 }
 
-                string port = InvokeRequired
+                string portText = InvokeRequired
                     ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim()))
                     : _txtPort.Text.Trim();
+                int port;
+                if (!int.TryParse(portText, out port)) port = 9876;
+
+                string keyError;
+                string keyPath = PublicTunnel.EnsureTunnelKey(out keyError);
+                if (keyPath == null)
+                {
+                    Log("[Auto-Tunnel] Could not create the SSH key the tunnel signs in with (" + keyError + "). Make sure the Windows 'OpenSSH Client' optional feature is installed.");
+                    return;
+                }
 
                 Log("[Auto-Tunnel] Starting background OpenSSH Public Internet TCP Relay for local port " + port + "...");
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    FileName = "ssh.exe",
-                    Arguments = string.Format("-p 443 -R0:localhost:{0} -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ServerAliveInterval=20 -o ExitOnForwardFailure=yes tcp@a.pinggy.io", port),
+                    FileName = PublicTunnel.FindOpenSshTool("ssh.exe"),
+                    Arguments = PublicTunnel.BuildSshArguments(port, keyPath),
                     UseShellExecute = false,
                     CreateNoWindow = true,
+                    // Our own stdin pipe, kept open: ssh neither takes it for a terminal nor sees EOF and quits.
+                    RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
-                _tunnelProc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                _tunnelProc.OutputDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
-                _tunnelProc.ErrorDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
-                _tunnelProc.Exited += (s, e) =>
+                Process proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+                proc.OutputDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
+                proc.ErrorDataReceived += (s, e) => ParseTunnelOutputLine(e.Data);
+                proc.Exited += (s, e) => OnTunnelExited(proc);
+                _tunnelProc = proc;
+                try
                 {
-                    if (_isRunning && _serverCts != null && !_serverCts.Token.IsCancellationRequested)
-                    {
-                        Task.Run(async () =>
-                        {
-                            try
-                            {
-                                await Task.Delay(5000, _serverCts.Token);
-                                if (_isRunning) StartBuiltInPublicSshTunnel();
-                            }
-                            catch { }
-                        });
-                    }
-                };
-                _tunnelProc.Start();
-                _tunnelProc.BeginOutputReadLine();
-                _tunnelProc.BeginErrorReadLine();
+                    proc.Start();
+                }
+                catch
+                {
+                    // A never-started Process would make the HasExited check above throw on every later attempt.
+                    _tunnelProc = null;
+                    throw;
+                }
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                Log("[Auto-Tunnel] Could not start ssh.exe (" + ex.Message + "). Install the Windows 'OpenSSH Client' optional feature.");
             }
             catch (Exception ex)
             {
@@ -975,33 +1012,85 @@ namespace TurboHost
             }
         }
 
+        private void OnTunnelExited(Process proc)
+        {
+            // An old tunnel killed by Stop + quick Start must not clear the address of the new one.
+            if (!ReferenceEquals(proc, _tunnelProc)) return;
+
+            // A dead tunnel's address must not stay in the ticket the keep-alive publishes.
+            string deadEndpoint = _activePublicTunnelEndpoint;
+            _activePublicTunnelEndpoint = "";
+
+            if (!IsDisposed && IsHandleCreated && !string.IsNullOrEmpty(deadEndpoint))
+            {
+                try { BeginInvoke(new Action(RemoveTunnelEndpointsFromList)); } catch (InvalidOperationException) { }
+            }
+
+            CancellationTokenSource cts = _serverCts;
+            if (_isRunning && cts != null && !cts.IsCancellationRequested)
+            {
+                Log("[Auto-Tunnel] Tunnel closed; reconnecting in 5 seconds...");
+                CancellationToken token = cts.Token;
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(5000, token);
+                        if (_isRunning && !token.IsCancellationRequested) StartBuiltInPublicSshTunnel();
+                    }
+                    catch { }
+                });
+            }
+        }
+
+        private void RemoveTunnelEndpointsFromList()
+        {
+            for (int i = _lstEndpoints.Items.Count - 1; i >= 0; i--)
+            {
+                string item = _lstEndpoints.Items[i] as string;
+                if (item != null && item.EndsWith(TunnelListSuffix)) _lstEndpoints.Items.RemoveAt(i);
+            }
+        }
+
         private void ParseTunnelOutputLine(string line)
         {
             if (string.IsNullOrWhiteSpace(line)) return;
-            // Detect "tcp://xxxx.pinggy.io:12345" in SSH output
-            int idx = line.IndexOf("tcp://", StringComparison.OrdinalIgnoreCase);
-            if (idx >= 0)
+            // pinggy prints e.g. "tcp://abcd-1-2-3-4.run.pinggy-free.link:35793"
+            string endpoint = PublicTunnel.TryParseEndpoint(line);
+            if (endpoint == null)
             {
-                string sub = line.Substring(idx + 6).Trim();
-                string endpoint = sub.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0];
-                if (endpoint.Contains(":") && _activePublicTunnelEndpoint != endpoint)
+                // Show what ssh says ("Permission denied", "Could not resolve hostname"), so a tunnel that
+                // fails is no longer silent. pinggy's free-tier banner is about pinggy accounts, not the PIN.
+                if (line.IndexOf("Permanently added", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    line.IndexOf("not authenticated", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    _activePublicTunnelEndpoint = endpoint;
-                    Log("[PUBLIC INTERNET TUNNEL ACTIVE] -> " + endpoint);
-                    // This runs on an ssh output thread: an exception here (form already closed) would
-                    // crash the process, so guard the cross-thread call.
-                    if (IsDisposed || !IsHandleCreated) return;
-                    try
-                    {
-                        BeginInvoke(new Action(async () =>
-                        {
-                            _lstEndpoints.Items.Insert(0, endpoint + " (Public Internet Tunnel)");
-                            await PublishTicketToCloudDirectoryAsync();
-                        }));
-                    }
-                    catch (InvalidOperationException) { }
+                    return;
                 }
+                if (line.IndexOf("expire in 60 minutes", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    Log("[Auto-Tunnel] Free pinggy tunnel: its address changes every 60 minutes; TurboRemote reconnects and re-publishes it automatically.");
+                    return;
+                }
+                Log("[Auto-Tunnel] " + line.Trim());
+                return;
             }
+
+            if (_activePublicTunnelEndpoint == endpoint) return;
+            _activePublicTunnelEndpoint = endpoint;
+            Log("[PUBLIC INTERNET TUNNEL ACTIVE] -> " + endpoint);
+            // This runs on an ssh output thread: an exception here (form already closed) would
+            // crash the process, so guard the cross-thread call.
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke(new Action(async () =>
+                {
+                    RemoveTunnelEndpointsFromList();
+                    _lstEndpoints.Items.Insert(0, endpoint + TunnelListSuffix);
+                    await PublishTicketToCloudDirectoryAsync();
+                }));
+            }
+            catch (InvalidOperationException) { }
         }
 
         public void ConfigureFromArgs(string[] args)
@@ -1078,7 +1167,8 @@ namespace TurboHost
             // 3. Automatically start & maintain Public Internet Tunnel (with auto-reconnect watchdog)
             StartBuiltInPublicSshTunnel();
 
-            // 4. Periodically refresh Cloud Rendezvous ticket every 4 minutes so Internet clients can always find this Host
+            // 4. Every 4 minutes, re-publish the Cloud Rendezvous ticket if it changed (new LAN IP, PIN or Host ID)
+            //    or the keep-alive is due, so Internet clients can always find this Host.
             while (_isRunning && !ct.IsCancellationRequested)
             {
                 await PublishTicketToCloudDirectoryAsync();
