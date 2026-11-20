@@ -34,6 +34,15 @@ namespace TurboHost
         private string _incomingFilePath;
         private volatile bool _forceGrayscale;
 
+        // Keys and mouse buttons this viewer is holding down, released when the session ends. A connection
+        // that dropped mid-keypress (or mid-drag) used to leave Ctrl/Shift/Alt or the mouse button stuck down
+        // on this PC until someone pressed it physically.
+        private struct HeldKey { public ushort Vk; public byte Scan; public bool? Extended; }
+        private readonly object _heldInputLock = new object();
+        private readonly Dictionary<int, HeldKey> _heldKeys = new Dictionary<int, HeldKey>();
+        private readonly HashSet<MouseActionType> _heldButtons = new HashSet<MouseActionType>();
+        private float _lastMouseX = 0.5f, _lastMouseY = 0.5f;
+
         // Auto-Adaptive quality: 0 = 2G, 1 = 3G/WAN, 2 = 4G/fast WAN, 3 = LAN. Only the screen loop touches these.
         private int _adaptiveLevel = 3;
         private long _adaptiveHoldStartMs;
@@ -75,6 +84,7 @@ namespace TurboHost
                 try { _client.Close(); } catch { }
                 try { await Task.WhenAll(screenTask, receiveTask); } catch { }
 
+                ReleaseHeldInput();
                 NativeInputInjector.SendSpecialCombo("LOCK_INPUT_OFF");
                 if (_incomingFileStream != null) _incomingFileStream.Dispose();
                 _urgentTrigger.Dispose();
@@ -290,6 +300,22 @@ namespace TurboHost
             float normX = BitConverter.ToSingle(data, 1);
             float normY = BitConverter.ToSingle(data, 5);
             int wheel = BitConverter.ToInt32(data, 9);
+
+            lock (_heldInputLock)
+            {
+                _lastMouseX = normX;
+                _lastMouseY = normY;
+                switch (action)
+                {
+                    case MouseActionType.LeftDown: case MouseActionType.RightDown: case MouseActionType.MiddleDown:
+                        _heldButtons.Add(action);
+                        break;
+                    case MouseActionType.LeftUp: _heldButtons.Remove(MouseActionType.LeftDown); break;
+                    case MouseActionType.RightUp: _heldButtons.Remove(MouseActionType.RightDown); break;
+                    case MouseActionType.MiddleUp: _heldButtons.Remove(MouseActionType.MiddleDown); break;
+                }
+            }
+
             // If user clicked or scrolled, wake up the screen encoder as soon as the click has been injected.
             NativeInputInjector.InjectMouse(action, normX, normY, wheel, _config.MonitorIndex,
                 action != MouseActionType.Move ? new Action(WakeScreenEncoder) : null);
@@ -300,7 +326,49 @@ namespace TurboHost
             if (data.Length < 3) return;
             ushort vk = BitConverter.ToUInt16(data, 0);
             bool isDown = data[2] == 1;
-            NativeInputInjector.InjectKey(vk, isDown, WakeScreenEncoder);
+            // Newer viewers add the scan code and the extended-key flag (bytes 3-4); older ones send only 3 bytes.
+            byte scan = data.Length >= 5 ? data[3] : (byte)0;
+            bool? extended = data.Length >= 5 ? (bool?)((data[4] & 1) != 0) : null;
+
+            int id = vk | (extended == true ? 0x10000 : 0);
+            lock (_heldInputLock)
+            {
+                if (isDown) _heldKeys[id] = new HeldKey { Vk = vk, Scan = scan, Extended = extended };
+                else _heldKeys.Remove(id);
+            }
+            NativeInputInjector.InjectKey(vk, isDown, scan, extended, WakeScreenEncoder);
+        }
+
+        private void ReleaseHeldInput()
+        {
+            List<HeldKey> keys;
+            List<MouseActionType> buttons;
+            float x, y;
+            lock (_heldInputLock)
+            {
+                keys = new List<HeldKey>(_heldKeys.Values);
+                buttons = new List<MouseActionType>(_heldButtons);
+                _heldKeys.Clear();
+                _heldButtons.Clear();
+                x = _lastMouseX;
+                y = _lastMouseY;
+            }
+
+            foreach (HeldKey k in keys)
+            {
+                NativeInputInjector.InjectKey(k.Vk, false, k.Scan, k.Extended);
+            }
+            foreach (MouseActionType b in buttons)
+            {
+                MouseActionType up = b == MouseActionType.RightDown ? MouseActionType.RightUp
+                    : b == MouseActionType.MiddleDown ? MouseActionType.MiddleUp
+                    : MouseActionType.LeftUp;
+                NativeInputInjector.InjectMouse(up, x, y, 0, _config.MonitorIndex);
+            }
+            if (keys.Count > 0 || buttons.Count > 0)
+            {
+                _log(string.Format("[Input] Released {0} key(s) and {1} mouse button(s) the viewer was still holding.", keys.Count, buttons.Count));
+            }
         }
 
         private void HandleConfigUpdate(byte[] data)
@@ -438,6 +506,14 @@ namespace TurboHost
 
         private async Task HandleSystemActionAsync(string action, CancellationToken ct)
         {
+            // "SYNC_LOCKS:CNS" with 1/0 for Caps, Num and Scroll Lock on the viewer's PC. Sent on every focus
+            // change, so it is not logged.
+            if (action.StartsWith("SYNC_LOCKS:") && action.Length >= 14)
+            {
+                NativeInputInjector.SyncLockKeys(action[11] == '1', action[12] == '1', action[13] == '1');
+                return;
+            }
+
             _log("[SystemAction] Triggered: " + action);
             if (action == "ELEVATE_ADMIN")
             {
@@ -1554,6 +1630,25 @@ namespace TurboHost
                 return (string)Invoke(new Func<string>(BuildElevatedRestartArgs));
             }
             return string.Format("--host --port {0} --pin \"{1}\"", _txtPort.Text.Trim(), _txtPin.Text.Trim());
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // A viewer sending Alt+F4 to close a remote program closed this window instead whenever it was the
+            // focused one, and the viewer lost this PC for good. Ask first; "No" is the default, so a stray
+            // Enter from the viewer keeps the Host running.
+            if (e.CloseReason == CloseReason.UserClosing && Volatile.Read(ref _connectedClients) > 0)
+            {
+                DialogResult answer = MessageBox.Show(this,
+                    "A remote viewer is connected to this PC.\n\nClose TurboRemote Host and disconnect them?",
+                    "TurboRemote Host", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (answer != DialogResult.Yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+            }
+            base.OnFormClosing(e);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)

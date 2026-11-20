@@ -113,6 +113,13 @@ You can switch profiles live during a session from the **Profile** dropdown:
 2. **💻 Zero-Bandwidth Remote PowerShell**: Run administrative PowerShell commands instantaneously using `< 1 KB` of compressed text—works even when video bandwidth is near zero.
 3. **📁 Ultra-Fast File Manager & Transfer**: Browse remote folders (double-click any `[DIR]` to open), upload local files to the Host, and download remote files to your `Downloads\TurboRemote` folder with automatic stream compression.
 
+### Keyboard in the Live Remote Desktop
+While the remote screen has keyboard focus (click it once), **every key goes to the remote PC**, including the Windows key and Win+combos, `Alt+Tab`, `Ctrl+Tab`, `Ctrl+Esc`, `Alt+Space`, `Alt+F4` and `Print Screen`. Switching tabs, using the toolbar, or clicking another program moves the keyboard back to your PC as expected.
+- **No stuck keys:** whenever the remote screen loses focus (another tab, `Alt+Tab` away, a dialog), any key or mouse button you were still holding is released on the remote PC. If the connection drops, the Host releases them itself.
+- **Caps / Num / Scroll Lock** work on your PC as usual, and the remote PC is kept in the same state.
+- **Stays on your PC:** `Win+L` (locks *your* PC; a locked remote PC could not be unlocked through TurboRemote), volume and media keys, and `Ctrl+Alt+Del` (Windows never lets a program capture it).
+- If a viewer sends `Alt+F4` while the TurboRemote Host window itself is focused, the Host asks before closing (`No` is the default), so the remote PC isn't lost by accident.
+
 ---
 
 ## 🔒 6. Security Architecture

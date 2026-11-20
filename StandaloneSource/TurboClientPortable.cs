@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,8 +15,17 @@ using TurboCore;
 
 namespace TurboClient
 {
+    /// <summary>A key for the remote PC: virtual key, hardware scan code, extended-key flag, pressed or released.</summary>
+    public delegate void RemoteKeyHandler(ushort vk, byte scanCode, bool extended, bool isDown);
+
     public class DoubleBufferedPanel : Panel
     {
+        private const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102, WM_DEADCHAR = 0x0103;
+        private const int WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105, WM_SYSCHAR = 0x0106, WM_SYSDEADCHAR = 0x0107;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetMessageExtraInfo();
+
         public DoubleBufferedPanel()
         {
             DoubleBuffered = true;
@@ -23,11 +33,16 @@ namespace TurboClient
             // so keys kept going to whatever toolbar control had it).
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
             TabStop = true;
+            // Keys go to the remote PC as keys; a local input method editor must not turn them into text here.
+            ImeMode = ImeMode.Disable;
             UpdateStyles();
         }
 
         /// <summary>True while a remote session is live.</summary>
         public bool CaptureAllKeys { get; set; }
+
+        /// <summary>Raised for every key that reaches the remote view while <see cref="CaptureAllKeys"/> is on.</summary>
+        public event RemoteKeyHandler RemoteKey;
 
         // While connected, treat every key as input so arrow keys, Tab, Enter and Escape raise KeyDown/KeyUp (and
         // get forwarded to the host) instead of being consumed locally for focus navigation. While disconnected,
@@ -35,6 +50,165 @@ namespace TurboClient
         protected override bool IsInputKey(Keys keyData)
         {
             return CaptureAllKeys || base.IsInputKey(keyData);
+        }
+
+        // While connected no parent (tab control, form) may treat a keystroke as one of its own shortcuts.
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            return CaptureAllKeys ? false : base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (CaptureAllKeys)
+            {
+                switch (m.Msg)
+                {
+                    case WM_KEYDOWN:
+                    case WM_SYSKEYDOWN:
+                    case WM_KEYUP:
+                    case WM_SYSKEYUP:
+                        ushort vk = (ushort)(m.WParam.ToInt64() & 0xFFFF);
+                        if (RemoteKeyboardHook.IsLocalOnlyKey(vk)) break; // volume/media keys act on this PC
+                        // Keys a Host on this same PC injected are not sent back to it (that echoed forever).
+                        if (!NativeInputInjector.IsInjectedByTurboRemote(GetMessageExtraInfo()))
+                        {
+                            long lParam = m.LParam.ToInt64();
+                            RemoteKeyHandler handler = RemoteKey;
+                            if (handler != null)
+                            {
+                                handler(vk, (byte)((lParam >> 16) & 0xFF), ((lParam >> 24) & 1) != 0,
+                                    m.Msg == WM_KEYDOWN || m.Msg == WM_SYSKEYDOWN);
+                            }
+                        }
+                        // Handled here, never by the default window procedure: Alt+Space used to open this
+                        // window's own menu (taking the next keys and leaving Alt down on the remote PC).
+                        return;
+                    case WM_CHAR:
+                    case WM_SYSCHAR:
+                    case WM_DEADCHAR:
+                    case WM_SYSDEADCHAR:
+                        return; // the remote PC types the character; no local beep or menu mnemonic
+                }
+            }
+            base.WndProc(ref m);
+        }
+    }
+
+    /// <summary>A Button that never takes keyboard focus, so clicking it leaves typing going to the remote PC.</summary>
+    public class NoFocusButton : Button
+    {
+        public NoFocusButton()
+        {
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+        }
+    }
+
+    /// <summary>
+    /// Low-level keyboard hook, active only while the remote view has focus in the foreground viewer window.
+    /// Windows handles Win, Win+R, Alt+Tab, Ctrl+Esc and Print Screen before any window sees them, so without
+    /// it those keys acted on THIS PC instead of the remote one. Lock keys and volume/media keys pass through.
+    /// </summary>
+    public sealed class RemoteKeyboardHook : IDisposable
+    {
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        private const int WH_KEYBOARD_LL = 13;
+        private const uint LLKHF_EXTENDED = 0x01;
+        private const uint LLKHF_UP = 0x80;
+
+        private readonly LowLevelKeyboardProc _proc; // kept referenced: the GC must not collect the callback
+        private readonly Func<bool> _isActive;
+        private readonly RemoteKeyHandler _onKey;
+        private readonly HashSet<uint> _swallowedDown = new HashSet<uint>();
+        private IntPtr _hook;
+
+        public RemoteKeyboardHook(Func<bool> isActive, RemoteKeyHandler onKey)
+        {
+            _isActive = isActive;
+            _onKey = onKey;
+            _proc = HookProc;
+            _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
+        }
+
+        public bool IsInstalled { get { return _hook != IntPtr.Zero; } }
+
+        /// <summary>Volume and media keys keep working on this PC (TurboRemote does not stream remote audio).</summary>
+        public static bool IsLocalOnlyKey(uint vk)
+        {
+            return (vk >= 0xAD && vk <= 0xB3) || vk == 0xE7 /* VK_PACKET */;
+        }
+
+        /// <summary>Caps/Num/Scroll Lock toggle on this PC as usual; the remote PC is synced to that state.</summary>
+        public static bool IsLockKey(uint vk)
+        {
+            return vk == 0x14 || vk == 0x90 || vk == 0x91;
+        }
+
+        private IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                try
+                {
+                    KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                    bool isUp = (k.flags & LLKHF_UP) != 0;
+                    bool isOurEcho = k.dwExtraInfo == NativeInputInjector.InjectedInputMarker;
+                    if (!isOurEcho)
+                    {
+                        if (isUp)
+                        {
+                            // Swallow only releases of presses we swallowed. A key already held when the viewer
+                            // took focus (e.g. Shift) must reach Windows, or Windows would think it is still down.
+                            if (_swallowedDown.Remove(k.vkCode))
+                            {
+                                _onKey((ushort)k.vkCode, (byte)k.scanCode, (k.flags & LLKHF_EXTENDED) != 0, false);
+                                return (IntPtr)1;
+                            }
+                        }
+                        else if (!IsLockKey(k.vkCode) && !IsLocalOnlyKey(k.vkCode) && _isActive())
+                        {
+                            _swallowedDown.Add(k.vkCode);
+                            _onKey((ushort)k.vkCode, (byte)k.scanCode, (k.flags & LLKHF_EXTENDED) != 0, true);
+                            return (IntPtr)1;
+                        }
+                    }
+                }
+                catch { }
+            }
+            return CallNextHookEx(_hook, nCode, wParam, lParam);
+        }
+
+        public void Dispose()
+        {
+            if (_hook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_hook);
+                _hook = IntPtr.Zero;
+            }
         }
     }
 
@@ -89,6 +263,24 @@ namespace TurboClient
         private string _downloadingFilePath;
         private bool _uploadInProgress;
 
+        // What the remote PC currently has pressed because of us. Whenever the remote view loses focus (tab
+        // switch, Alt+Tab, another app, a dialog) these are released there; keys and buttons used to stay stuck
+        // down on the remote PC because their release went to another tab or program.
+        private struct HeldRemoteKey { public ushort Vk; public byte Scan; public bool Extended; }
+        private readonly Dictionary<int, HeldRemoteKey> _remoteKeysDown = new Dictionary<int, HeldRemoteKey>();
+        private readonly HashSet<MouseActionType> _remoteButtonsDown = new HashSet<MouseActionType>();
+        private float _lastMouseNx = 0.5f, _lastMouseNy = 0.5f;
+        private RemoteKeyboardHook _keyboardHook;
+        private Button _btnLockInput;
+
+        private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool LockWorkStation();
+
         public ClientMainForm()
         {
             Text = "TurboRemote — Viewer Client";
@@ -97,7 +289,6 @@ namespace TurboClient
             BackColor = Color.FromArgb(16, 18, 24);
             ForeColor = Color.FromArgb(230, 235, 245);
             Font = new Font("Segoe UI", 9f);
-            KeyPreview = true;
 
             InitializeUi();
 
@@ -177,6 +368,7 @@ namespace TurboClient
             });
             _cmbBandwidth.SelectedIndex = 4; // Default to Auto-Adaptive Smart Speed
             _cmbBandwidth.SelectedIndexChanged += async (s, e) => await SendStreamConfigAsync();
+            _cmbBandwidth.DropDownClosed += (s, e) => FocusSelectedTabSoon();
 
             _chkGrayscale = new CheckBox
             {
@@ -186,29 +378,33 @@ namespace TurboClient
                 ForeColor = Color.FromArgb(190, 205, 230)
             };
             _chkGrayscale.CheckedChanged += async (s, e) => await SendStreamConfigAsync();
+            _chkGrayscale.CheckedChanged += (s, e) => FocusSelectedTabSoon();
 
-            Button btnRefreshFrame = CreateToolbarButton("🔄 Keyframe", 12, 46, 94, 28, Color.FromArgb(50, 70, 105));
+            // The session buttons never take keyboard focus: after clicking one, typing keeps going to the
+            // remote PC (and Space/Enter cannot re-press the button, e.g. "Task Mgr", by accident).
+            Button btnRefreshFrame = CreateToolbarButton("🔄 Keyframe", 12, 46, 94, 28, Color.FromArgb(50, 70, 105), false);
             btnRefreshFrame.Click += async (s, e) => await SendPacketSafeAsync(PacketType.ForceFullFrame, new byte[0]);
 
-            Button btnElevateHost = CreateToolbarButton("🛡 Elevate Host UAC", 112, 46, 134, 28, Color.FromArgb(175, 105, 30));
+            Button btnElevateHost = CreateToolbarButton("🛡 Elevate Host UAC", 112, 46, 134, 28, Color.FromArgb(175, 105, 30), false);
             btnElevateHost.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("ELEVATE_ADMIN"));
 
-            Button btnLockInput = CreateToolbarButton("🔒 Lock Host Input", 252, 46, 125, 28, Color.FromArgb(135, 55, 75));
-            btnLockInput.Click += async (s, e) =>
+            _btnLockInput = CreateToolbarButton("🔒 Lock Host Input", 252, 46, 125, 28, Color.FromArgb(135, 55, 75), false);
+            _btnLockInput.Click += async (s, e) =>
             {
+                if (!_isConnected) return;
                 _remoteInputLocked = !_remoteInputLocked;
-                btnLockInput.Text = _remoteInputLocked ? "🔓 Unlock Input" : "🔒 Lock Host Input";
+                _btnLockInput.Text = _remoteInputLocked ? "🔓 Unlock Input" : "🔒 Lock Host Input";
                 string cmd = _remoteInputLocked ? "LOCK_INPUT_ON" : "LOCK_INPUT_OFF";
                 await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes(cmd));
             };
 
-            Button btnTaskMgr = CreateToolbarButton("📊 Task Mgr", 383, 46, 92, 28, Color.FromArgb(55, 65, 95));
+            Button btnTaskMgr = CreateToolbarButton("📊 Task Mgr", 383, 46, 92, 28, Color.FromArgb(55, 65, 95), false);
             btnTaskMgr.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("TASK_MGR"));
 
-            Button btnShowDesktop = CreateToolbarButton("🖥 Win+D", 481, 46, 78, 28, Color.FromArgb(55, 65, 95));
+            Button btnShowDesktop = CreateToolbarButton("🖥 Win+D", 481, 46, 78, 28, Color.FromArgb(55, 65, 95), false);
             btnShowDesktop.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("WIN_D"));
 
-            Button btnPushClip = CreateToolbarButton("📋 Push Clip", 565, 46, 95, 28, Color.FromArgb(55, 65, 95));
+            Button btnPushClip = CreateToolbarButton("📋 Push Clip", 565, 46, 95, 28, Color.FromArgb(55, 65, 95), false);
             btnPushClip.Click += async (s, e) =>
             {
                 if (Clipboard.ContainsText())
@@ -217,7 +413,7 @@ namespace TurboClient
                 }
             };
 
-            Button btnPullClip = CreateToolbarButton("📥 Pull Clip", 666, 46, 95, 28, Color.FromArgb(55, 65, 95));
+            Button btnPullClip = CreateToolbarButton("📥 Pull Clip", 666, 46, 95, 28, Color.FromArgb(55, 65, 95), false);
             btnPullClip.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("GET_CLIPBOARD"));
 
             _cmbMonitor = new ComboBox
@@ -231,6 +427,7 @@ namespace TurboClient
             _cmbMonitor.Items.AddRange(new object[] { "Monitor 1", "Monitor 2", "Monitor 3" });
             _cmbMonitor.SelectedIndex = 0;
             _cmbMonitor.SelectedIndexChanged += async (s, e) => await SendStreamConfigAsync();
+            _cmbMonitor.DropDownClosed += (s, e) => FocusSelectedTabSoon();
 
             _lblTelemetry = new Label
             {
@@ -245,7 +442,7 @@ namespace TurboClient
             {
                 lblHost, _txtHostIp, lblPort, _txtPort, lblPin, _txtPin,
                 _btnConnect, _btnListenReverse, lblMode, _cmbBandwidth, _chkGrayscale,
-                btnRefreshFrame, btnElevateHost, btnLockInput, btnTaskMgr, btnShowDesktop, btnPushClip, btnPullClip, _cmbMonitor, _lblTelemetry
+                btnRefreshFrame, btnElevateHost, _btnLockInput, btnTaskMgr, btnShowDesktop, btnPushClip, btnPullClip, _cmbMonitor, _lblTelemetry
             });
 
             _tabControl = new TabControl
@@ -270,6 +467,11 @@ namespace TurboClient
             _screenCanvas.MouseDown += OnCanvasMouseDown;
             _screenCanvas.MouseUp += OnCanvasMouseUp;
             _screenCanvas.MouseWheel += OnCanvasMouseWheel;
+            _screenCanvas.RemoteKey += OnRemoteKey;
+            // Losing focus covers every way of leaving: another tab, Alt+Tab, another app, a dialog, minimize.
+            _screenCanvas.LostFocus += (s, e) => ReleaseRemoteInput();
+            // Caps/Num/Scroll Lock may have been toggled elsewhere meanwhile; match the remote PC to this one.
+            _screenCanvas.GotFocus += async (s, e) => await SendLockKeyStateAsync();
 
             tabDesktop.Controls.Add(_screenCanvas);
 
@@ -288,6 +490,11 @@ namespace TurboClient
             _tabControl.TabPages.Add(tabDesktop);
             _tabControl.TabPages.Add(tabTerminal);
             _tabControl.TabPages.Add(tabFiles);
+            // Put the keyboard where the user expects it after switching tabs (clicking a tab header used to
+            // leave focus on the header, where arrow keys flip tabs instead of reaching the remote PC).
+            _tabControl.SelectedIndexChanged += (s, e) => FocusSelectedTabSoon();
+            _tabControl.MouseUp += (s, e) => FocusSelectedTabSoon();
+            Deactivate += (s, e) => ReleaseRemoteInput();
 
             Controls.Add(_tabControl);
             Controls.Add(topBar);
@@ -626,7 +833,15 @@ namespace TurboClient
 
             // Give the remote view keyboard focus so typing goes to the host right away.
             _screenCanvas.CaptureAllKeys = true;
-            if (_tabControl.SelectedIndex == 0) _screenCanvas.Focus();
+            if (_keyboardHook == null)
+            {
+                _keyboardHook = new RemoteKeyboardHook(IsRemoteKeyboardActive, OnRemoteKey);
+            }
+            if (_tabControl.SelectedIndex == 0)
+            {
+                if (_screenCanvas.Focused) await SendLockKeyStateAsync();
+                else _screenCanvas.Focus();
+            }
 
             // Hand this session's stream/keys/token to its loop, so it can never pick up a later session's.
             NetworkStream activeStream = _stream;
@@ -640,6 +855,17 @@ namespace TurboClient
             _isConnected = false;
             _isConnecting = false;
             _screenCanvas.CaptureAllKeys = false;
+            if (_keyboardHook != null)
+            {
+                _keyboardHook.Dispose();
+                _keyboardHook = null;
+            }
+            // The Host releases whatever this session still held when the connection closes.
+            _remoteKeysDown.Clear();
+            _remoteButtonsDown.Clear();
+            // The Host unlocks its input when a session ends; the button must not keep saying "Unlock".
+            _remoteInputLocked = false;
+            _btnLockInput.Text = "🔒 Lock Host Input";
             try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
 
@@ -788,6 +1014,8 @@ namespace TurboClient
 
             float nx, ny;
             GetNormalizedCanvasCoords(e.X, e.Y, out nx, out ny);
+            _lastMouseNx = nx;
+            _lastMouseNy = ny;
             await SendMousePacketAsync(MouseActionType.Move, nx, ny, 0);
         }
 
@@ -800,6 +1028,10 @@ namespace TurboClient
             MouseActionType act = MouseActionType.LeftDown;
             if (e.Button == MouseButtons.Right) act = MouseActionType.RightDown;
             else if (e.Button == MouseButtons.Middle) act = MouseActionType.MiddleDown;
+            else if (e.Button != MouseButtons.Left) return; // X1/X2 side buttons are not supported by the Host
+            _lastMouseNx = nx;
+            _lastMouseNy = ny;
+            _remoteButtonsDown.Add(act);
             await SendMousePacketAsync(act, nx, ny, 0);
         }
 
@@ -808,9 +1040,12 @@ namespace TurboClient
             if (!_isConnected) return;
             float nx, ny;
             GetNormalizedCanvasCoords(e.X, e.Y, out nx, out ny);
-            MouseActionType act = MouseActionType.LeftUp;
-            if (e.Button == MouseButtons.Right) act = MouseActionType.RightUp;
-            else if (e.Button == MouseButtons.Middle) act = MouseActionType.MiddleUp;
+            MouseActionType down = MouseActionType.LeftDown, act = MouseActionType.LeftUp;
+            if (e.Button == MouseButtons.Right) { down = MouseActionType.RightDown; act = MouseActionType.RightUp; }
+            else if (e.Button == MouseButtons.Middle) { down = MouseActionType.MiddleDown; act = MouseActionType.MiddleUp; }
+            else if (e.Button != MouseButtons.Left) return;
+            // Already released when focus left the remote view (e.g. Alt+Tab in the middle of a drag).
+            if (!_remoteButtonsDown.Remove(down)) return;
             await SendMousePacketAsync(act, nx, ny, 0);
         }
 
@@ -822,28 +1057,121 @@ namespace TurboClient
             await SendMousePacketAsync(MouseActionType.Wheel, nx, ny, e.Delta);
         }
 
-        protected override void OnKeyDown(KeyEventArgs e)
+        /// <summary>The low-level hook takes keys only while the remote view has focus in the foreground window.</summary>
+        private bool IsRemoteKeyboardActive()
         {
-            if (_isConnected && _tabControl.SelectedIndex == 0 && !_txtHostIp.Focused && !_txtPort.Focused && !_txtPin.Focused)
-            {
-                e.Handled = true;
-                // Start the send right here on the UI thread so packets queue in keystroke order. Task.Run let a
-                // key-up overtake its key-down, leaving keys (Shift, Ctrl...) stuck down on the host.
-                Task send = SendKeyPacketAsync((ushort)e.KeyValue, true);
-                return;
-            }
-            base.OnKeyDown(e);
+            return _isConnected && _screenCanvas.CaptureAllKeys && _screenCanvas.Focused &&
+                   WindowState != FormWindowState.Minimized && GetForegroundWindow() == Handle;
         }
 
-        protected override void OnKeyUp(KeyEventArgs e)
+        /// <summary>
+        /// Every key for the remote PC arrives here, from the keyboard hook or (if Windows removed the hook) from
+        /// the remote view's own window messages. Runs on the UI thread, so packets queue in keystroke order.
+        /// </summary>
+        private void OnRemoteKey(ushort vk, byte scanCode, bool extended, bool isDown)
         {
-            if (_isConnected && _tabControl.SelectedIndex == 0 && !_txtHostIp.Focused && !_txtPort.Focused && !_txtPin.Focused)
+            if (!_isConnected) return;
+
+            if (RemoteKeyboardHook.IsLockKey(vk))
             {
-                e.Handled = true;
-                Task send = SendKeyPacketAsync((ushort)e.KeyValue, false);
+                // Toggled on this PC as usual; once released, the remote PC is set to the same state.
+                if (!isDown)
+                {
+                    Task sync = SendLockKeyStateAsync();
+                }
                 return;
             }
-            base.OnKeyUp(e);
+
+            if (isDown && vk == VK_L && (IsRemoteKeyDown(VK_LWIN) || IsRemoteKeyDown(VK_RWIN)))
+            {
+                // Win+L locks THIS PC, as everywhere else. Sent on, it locked the remote PC, whose lock screen
+                // TurboRemote can neither show nor type into, so the remote PC was lost until someone was there.
+                ReleaseRemoteInput();
+                LockWorkStation();
+                return;
+            }
+
+            int id = vk | (extended ? 0x10000 : 0);
+            if (isDown)
+            {
+                _remoteKeysDown[id] = new HeldRemoteKey { Vk = vk, Scan = scanCode, Extended = extended };
+            }
+            else if (!_remoteKeysDown.Remove(id))
+            {
+                // Windows delivers only the release of Print Screen to programs; press it here first.
+                if (vk != VK_SNAPSHOT) return; // its press never reached the remote (or it was already released)
+                Task press = SendKeyPacketAsync(vk, scanCode, extended, true);
+            }
+
+            Task send = SendKeyPacketAsync(vk, scanCode, extended, isDown);
+        }
+
+        private bool IsRemoteKeyDown(ushort vk)
+        {
+            return _remoteKeysDown.ContainsKey(vk) || _remoteKeysDown.ContainsKey(vk | 0x10000);
+        }
+
+        /// <summary>Releases on the remote PC every key and mouse button it still has pressed because of us.</summary>
+        private void ReleaseRemoteInput()
+        {
+            if (!_isConnected)
+            {
+                _remoteKeysDown.Clear();
+                _remoteButtonsDown.Clear();
+                return;
+            }
+
+            foreach (HeldRemoteKey k in new List<HeldRemoteKey>(_remoteKeysDown.Values))
+            {
+                Task up = SendKeyPacketAsync(k.Vk, k.Scan, k.Extended, false);
+            }
+            _remoteKeysDown.Clear();
+
+            foreach (MouseActionType b in new List<MouseActionType>(_remoteButtonsDown))
+            {
+                MouseActionType up = b == MouseActionType.RightDown ? MouseActionType.RightUp
+                    : b == MouseActionType.MiddleDown ? MouseActionType.MiddleUp
+                    : MouseActionType.LeftUp;
+                Task send = SendMousePacketAsync(up, _lastMouseNx, _lastMouseNy, 0);
+            }
+            _remoteButtonsDown.Clear();
+        }
+
+        private async Task SendLockKeyStateAsync()
+        {
+            if (!_isConnected) return;
+            string state = "SYNC_LOCKS:" +
+                (IsKeyLocked(Keys.CapsLock) ? "1" : "0") +
+                (IsKeyLocked(Keys.NumLock) ? "1" : "0") +
+                (IsKeyLocked(Keys.Scroll) ? "1" : "0");
+            await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes(state));
+        }
+
+        /// <summary>After switching tabs (or using a toolbar list), give the keyboard to that tab's main input.</summary>
+        private void FocusSelectedTabSoon()
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(new Action(() =>
+            {
+                if (_tabControl.SelectedIndex == 0)
+                {
+                    if (_screenCanvas.CanFocus && !_screenCanvas.Focused) _screenCanvas.Focus();
+                }
+                else if (_tabControl.SelectedIndex == 1)
+                {
+                    if (_txtTerminalInput.CanFocus && !_txtTerminalInput.Focused) _txtTerminalInput.Focus();
+                }
+            }));
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            if (_keyboardHook != null)
+            {
+                _keyboardHook.Dispose();
+                _keyboardHook = null;
+            }
+            base.OnFormClosed(e);
         }
 
         private async Task SendMousePacketAsync(MouseActionType action, float nx, float ny, int wheel)
@@ -856,11 +1184,15 @@ namespace TurboClient
             await SendPacketSafeAsync(PacketType.MouseInput, buf);
         }
 
-        private async Task SendKeyPacketAsync(ushort vk, bool isDown)
+        /// <summary>Payload: virtual key (2 bytes), down (1), scan code (1), flags (1, bit 0 = extended key).
+        /// Older Hosts read only the first 3 bytes.</summary>
+        private async Task SendKeyPacketAsync(ushort vk, byte scanCode, bool extended, bool isDown)
         {
-            byte[] buf = new byte[3];
+            byte[] buf = new byte[5];
             Buffer.BlockCopy(BitConverter.GetBytes(vk), 0, buf, 0, 2);
             buf[2] = (byte)(isDown ? 1 : 0);
+            buf[3] = scanCode;
+            buf[4] = (byte)(extended ? 1 : 0);
             await SendPacketSafeAsync(PacketType.KeyInput, buf);
         }
 
@@ -1068,19 +1400,18 @@ namespace TurboClient
             catch { }
         }
 
-        private static Button CreateToolbarButton(string text, int x, int y, int w, int h, Color bg)
+        private static Button CreateToolbarButton(string text, int x, int y, int w, int h, Color bg, bool takesFocus = true)
         {
-            return new Button
-            {
-                Text = text,
-                Location = new Point(x, y),
-                Size = new Size(w, h),
-                BackColor = bg,
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8.4f, FontStyle.Bold),
-                Cursor = Cursors.Hand
-            };
+            Button btn = takesFocus ? new Button() : new NoFocusButton();
+            btn.Text = text;
+            btn.Location = new Point(x, y);
+            btn.Size = new Size(w, h);
+            btn.BackColor = bg;
+            btn.ForeColor = Color.White;
+            btn.FlatStyle = FlatStyle.Flat;
+            btn.Font = new Font("Segoe UI", 8.4f, FontStyle.Bold);
+            btn.Cursor = Cursors.Hand;
+            return btn;
         }
     }
 }

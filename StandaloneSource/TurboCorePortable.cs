@@ -1031,6 +1031,23 @@ namespace TurboCore
         [DllImport("user32.dll", SetLastError = true)]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+        [DllImport("user32.dll")]
+        private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int nVirtKey);
+
+        /// <summary>
+        /// Stamped on every key the Host injects. A viewer running on the same PC (e.g. "Launch Both") ignores
+        /// keys carrying it; otherwise each injected key was captured and sent back to the Host again, forever.
+        /// </summary>
+        public static readonly UIntPtr InjectedInputMarker = (UIntPtr)0x54524D54u;
+
+        public static bool IsInjectedByTurboRemote(IntPtr extraInfo)
+        {
+            return unchecked((ulong)extraInfo.ToInt64()) == InjectedInputMarker.ToUInt64();
+        }
+
         // Private on purpose: only call it through the input thread (see PostToInputThread).
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool BlockInput(bool fBlockIt);
@@ -1218,36 +1235,78 @@ namespace TurboCore
             catch { }
         }
 
-        /// <summary>Queues a key event; <paramref name="onInjected"/> runs right after it was injected.</summary>
-        public static void InjectKey(ushort virtualKeyCode, bool isKeyDown, Action onInjected = null)
+        /// <summary>
+        /// Queues a key event; <paramref name="onInjected"/> runs right after it was injected.
+        /// <paramref name="scanCode"/> 0 and <paramref name="extended"/> null mean "not sent by the viewer"
+        /// (older viewers send only the virtual key); both are then derived from the virtual key.
+        /// </summary>
+        public static void InjectKey(ushort virtualKeyCode, bool isKeyDown, byte scanCode, bool? extended, Action onInjected = null)
         {
             PostToInputThread(() =>
             {
-                InjectKeyNow(virtualKeyCode, isKeyDown);
+                InjectKeyNow(virtualKeyCode, isKeyDown, scanCode, extended);
                 if (onInjected != null) onInjected();
             });
         }
 
-        private static void InjectKeyNow(ushort virtualKeyCode, bool isKeyDown)
+        private const byte VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
+        private const byte VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1, VK_LCONTROL = 0xA2, VK_RCONTROL = 0xA3, VK_LMENU = 0xA4, VK_RMENU = 0xA5;
+        private const byte VK_CAPITAL = 0x14, VK_NUMLOCK = 0x90, VK_SCROLL = 0x91;
+
+        private static void InjectKeyNow(ushort virtualKeyCode, bool isKeyDown, byte scanCode = 0, bool? extended = null)
         {
             try
             {
                 byte vk = (byte)(virtualKeyCode & 0xFF);
-                uint flags = isKeyDown ? 0u : KEYEVENTF_KEYUP;
-                if (IsExtendedKey(vk))
+                bool isExtended = extended ?? IsExtendedKey(vk);
+
+                // A viewer's window messages only say "Shift/Ctrl/Alt"; press the side it was pressed on, so
+                // Right Alt stays AltGr and Right Ctrl stays Right Ctrl on the remote PC.
+                switch (vk)
                 {
-                    flags |= KEYEVENTF_EXTENDEDKEY;
+                    case VK_SHIFT: vk = scanCode == 0x36 ? VK_RSHIFT : VK_LSHIFT; break;
+                    case VK_CONTROL: vk = isExtended ? VK_RCONTROL : VK_LCONTROL; break;
+                    case VK_MENU: vk = isExtended ? VK_RMENU : VK_LMENU; break;
                 }
-                keybd_event(vk, 0, flags, UIntPtr.Zero);
+
+                // Scan code 0 left programs that read scan codes (games, terminals, some Java/Electron apps)
+                // with no key at all.
+                if (scanCode == 0) scanCode = (byte)MapVirtualKey(vk, 0 /* MAPVK_VK_TO_VSC */);
+
+                uint flags = isKeyDown ? 0u : KEYEVENTF_KEYUP;
+                if (isExtended) flags |= KEYEVENTF_EXTENDEDKEY;
+                keybd_event(vk, scanCode, flags, InjectedInputMarker);
             }
             catch { }
         }
 
         private static bool IsExtendedKey(byte vk)
         {
-            return vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 ||
-                   vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 ||
-                   vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C;
+            return vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 ||   // PgUp PgDn End Home
+                   vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 ||   // arrows
+                   vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C ||   // Ins Del LWin RWin
+                   vk == 0x03 || vk == 0x2C || vk == 0x5D || vk == 0x6F ||   // Break PrtSc Apps Num/
+                   vk == VK_NUMLOCK || vk == VK_RCONTROL || vk == VK_RMENU ||
+                   (vk >= 0xA6 && vk <= 0xB7);                                // browser, media and launch keys
+        }
+
+        /// <summary>Makes Caps/Num/Scroll Lock on this PC match the viewer's, toggling only what differs.</summary>
+        public static void SyncLockKeys(bool capsOn, bool numOn, bool scrollOn)
+        {
+            PostToInputThread(() =>
+            {
+                SyncOneLockKey(VK_CAPITAL, capsOn);
+                SyncOneLockKey(VK_NUMLOCK, numOn);
+                SyncOneLockKey(VK_SCROLL, scrollOn);
+            });
+        }
+
+        private static void SyncOneLockKey(byte vk, bool wantOn)
+        {
+            bool isOn = (GetKeyState(vk) & 1) != 0;
+            if (isOn == wantOn) return;
+            InjectKeyNow(vk, true);
+            InjectKeyNow(vk, false);
         }
 
         public static void SendSpecialCombo(string comboName)
