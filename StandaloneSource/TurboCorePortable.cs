@@ -516,6 +516,12 @@ namespace TurboCore
 
     public static class TurboProtocol
     {
+        /// <summary>
+        /// Shown in both windows and sent by the Host after sign-in, so a viewer can tell when the other PC runs an
+        /// older TurboRemote. Builds before this one did not report a version. Bump it with every release.
+        /// </summary>
+        public const string AppVersion = "2026.11.23";
+
         private static readonly byte[] MagicHeader = new byte[] { 0x54, 0x52, 0x42, 0x4F }; // 'TRBO'
 
         public static string GenerateStrongAccessKey()

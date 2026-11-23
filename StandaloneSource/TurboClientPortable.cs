@@ -272,6 +272,7 @@ namespace TurboClient
         private float _lastMouseNx = 0.5f, _lastMouseNy = 0.5f;
         private RemoteKeyboardHook _keyboardHook;
         private Button _btnLockInput;
+        private Label _lblNotice;
 
         private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
 
@@ -283,7 +284,7 @@ namespace TurboClient
 
         public ClientMainForm()
         {
-            Text = "TurboRemote — Viewer Client";
+            Text = "TurboRemote — Viewer Client  v" + TurboProtocol.AppVersion;
             Size = new Size(1250, 800);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 24);
@@ -496,7 +497,21 @@ namespace TurboClient
             _tabControl.MouseUp += (s, e) => FocusSelectedTabSoon();
             Deactivate += (s, e) => ReleaseRemoteInput();
 
+            _lblNotice = new Label
+            {
+                Dock = DockStyle.Top,
+                Height = 40,
+                Visible = false,
+                Padding = new Padding(12, 0, 12, 0),
+                TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = Color.FromArgb(120, 82, 10),
+                ForeColor = Color.FromArgb(255, 238, 190),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+
+            // Docked in reverse order: toolbar on top, the notice below it, the tabs filling the rest.
             Controls.Add(_tabControl);
+            Controls.Add(_lblNotice);
             Controls.Add(topBar);
         }
 
@@ -821,12 +836,15 @@ namespace TurboClient
             string[] parts = authText.Split('|');
             string remoteMachine = parts.Length > 1 ? parts[1] : "RemotePC";
             string privLevel = parts.Length > 2 ? parts[2] : "USER";
+            // Hosts from v2026.11.23 on add their version as field 6; older ones send nothing there.
+            string hostVersion = parts.Length > 5 && parts[5].StartsWith("v") ? parts[5].Substring(1) : null;
 
             _isConnected = true;
             _btnConnect.Text = "⏹ Disconnect";
             _btnConnect.BackColor = Color.FromArgb(185, 55, 55);
             string routeInfo = winningRoute != null ? string.Format("{0} ({1}:{2})", winningRoute.RouteLabel, winningRoute.Host, winningRoute.Port) : "Direct";
-            Text = string.Format("🔒 AES-256 Connected -> {0} [{1} | Route: {2}]", remoteMachine, privLevel, routeInfo);
+            Text = string.Format("🔒 AES-256 Connected -> {0} [{1} | Route: {2} | Host {3}]", remoteMachine, privLevel, routeInfo, hostVersion != null ? "v" + hostVersion : "older build");
+            ShowConnectionNotice(remoteMachine, hostVersion);
 
             await SendStreamConfigAsync();
             await RequestRemoteFileListAsync("DEFAULT");
@@ -866,6 +884,7 @@ namespace TurboClient
             // The Host unlocks its input when a session ends; the button must not keep saying "Unlock".
             _remoteInputLocked = false;
             _btnLockInput.Text = "🔒 Lock Host Input";
+            _lblNotice.Visible = false;
             try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
 
@@ -1145,6 +1164,30 @@ namespace TurboClient
                 (IsKeyLocked(Keys.NumLock) ? "1" : "0") +
                 (IsKeyLocked(Keys.Scroll) ? "1" : "0");
             await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes(state));
+        }
+
+        /// <summary>
+        /// Explains, up front, the two setups in which typing looks broken while the mouse still works, instead of
+        /// leaving the user to guess.
+        /// </summary>
+        private void ShowConnectionNotice(string remoteMachine, string hostVersion)
+        {
+            string notice = null;
+            if (string.Equals(remoteMachine, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            {
+                notice = "⚠ This viewer is connected to the PC it is running on. Keys you type are injected straight back into " +
+                         "this viewer window, and the mouse pointer follows the remote view, so the keyboard cannot be used or " +
+                         "tested this way. Connect from a second PC.";
+            }
+            else if (hostVersion == null)
+            {
+                notice = "⚠ " + remoteMachine + " runs an older TurboRemote. With it, Ctrl/Alt/Shift can stay stuck after Alt+Tab or " +
+                         "switching tabs, and then typing stops working while the mouse still does. Copy this TurboRemote.exe " +
+                         "(v" + TurboProtocol.AppVersion + ") to " + remoteMachine + " and restart the Host there.";
+            }
+
+            _lblNotice.Text = notice ?? "";
+            _lblNotice.Visible = notice != null;
         }
 
         /// <summary>After switching tabs (or using a toolbar list), give the keyboard to that tab's main input.</summary>

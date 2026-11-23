@@ -15,7 +15,7 @@ namespace TurboUnified
     {
         public UnifiedLauncherForm()
         {
-            Text = "TurboRemote";
+            Text = "TurboRemote  v" + TurboProtocol.AppVersion;
             Size = new Size(560, 360);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 26);

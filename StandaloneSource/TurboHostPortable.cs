@@ -321,9 +321,17 @@ namespace TurboHost
                 action != MouseActionType.Move ? new Action(WakeScreenEncoder) : null);
         }
 
+        private bool _warnedOldViewer;
+
         private void HandleKeyInput(byte[] data)
         {
             if (data.Length < 3) return;
+            if (data.Length < 5 && !_warnedOldViewer)
+            {
+                // Only builds before v2026.11.23 send 3-byte keys; their keyboard handling leaves keys stuck.
+                _warnedOldViewer = true;
+                _log("[Input] The viewer PC runs an older TurboRemote: keys can get stuck after Alt+Tab or tab switches there. Copy this TurboRemote.exe (v" + TurboProtocol.AppVersion + ") to that PC.");
+            }
             ushort vk = BitConverter.ToUInt16(data, 0);
             bool isDown = data[2] == 1;
             // Newer viewers add the scan code and the extended-key flag (bytes 3-4); older ones send only 3 bytes.
@@ -730,7 +738,7 @@ namespace TurboHost
 
         public HostMainForm()
         {
-            Text = "TurboRemote — Host Server";
+            Text = "TurboRemote — Host Server  v" + TurboProtocol.AppVersion;
             Size = new Size(775, 645);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(18, 20, 28);
@@ -1601,7 +1609,8 @@ namespace TurboHost
                         if (!sharedAddress) BruteForceProtector.ResetAttempts(remoteIpOnly);
 
                         // 3. Send AES-256 + HMAC-SHA256 Encrypted AuthResult back to Client
-                        string machineInfo = string.Format("OK|{0}|{1}|{2}|AES-256-HMAC-SHA256", Environment.MachineName, NativeInputInjector.IsRunningAsAdmin() ? "ADMIN" : "USER", Screen.AllScreens.Length);
+                        // Field 6 (the version) is new; older viewers read only the first fields and ignore it.
+                        string machineInfo = string.Format("OK|{0}|{1}|{2}|AES-256-HMAC-SHA256|v{3}", Environment.MachineName, NativeInputInjector.IsRunningAsAdmin() ? "ADMIN" : "USER", Screen.AllScreens.Length, TurboProtocol.AppVersion);
                         await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthResult, Encoding.UTF8.GetBytes(machineInfo), ct, sec);
                         Log("[Security VERIFIED] " + remoteEp + " authenticated via Zero-Knowledge PBKDF2-SHA256 & AES-256 E2EE.");
 
