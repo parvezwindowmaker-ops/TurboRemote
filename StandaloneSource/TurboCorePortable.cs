@@ -2059,4 +2059,226 @@ namespace TurboCore
             return endpoint;
         }
     }
+
+    public enum TailscaleState { NotInstalled, Stopped, SignedOut, Starting, Running }
+
+    /// <summary>What Tailscale reports about this PC. Strings are empty when unknown.</summary>
+    public sealed class TailscaleStatus
+    {
+        public TailscaleState State = TailscaleState.Stopped;
+        /// <summary>MagicDNS name, e.g. "office-pc.tail1234.ts.net" (no trailing dot).</summary>
+        public string DnsName = "";
+        public string HostName = "";
+        public string IPv4 = "";
+
+        public bool IsRunning { get { return State == TailscaleState.Running; } }
+    }
+
+    /// <summary>
+    /// Tailscale (free mesh VPN) gives every PC in an account a permanent name and 100.64.0.0/10 address that
+    /// works from anywhere, which is TurboRemote's recommended way to connect over the Internet.
+    /// </summary>
+    public static class TailscaleInfo
+    {
+        public static string DefaultCliPath
+        {
+            get { return Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tailscale"), "tailscale.exe"); }
+        }
+
+        /// <summary>True only for 100.64.0.0 - 100.127.255.255, the range Tailscale hands out.</summary>
+        public static bool IsTailscaleAddress(string ip)
+        {
+            IPAddress addr;
+            if (string.IsNullOrEmpty(ip) || !IPAddress.TryParse(ip, out addr) || addr.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = addr.GetAddressBytes();
+            return b[0] == 100 && (b[1] & 0xC0) == 0x40;
+        }
+
+        /// <summary>Reads the output of "tailscale status --json". Only this PC's own entry ("Self") is used.</summary>
+        public static TailscaleStatus Parse(string statusJson)
+        {
+            TailscaleStatus st = new TailscaleStatus();
+            if (string.IsNullOrEmpty(statusJson)) return st;
+            try
+            {
+                switch (ReadString(statusJson, "BackendState", 0, statusJson.Length))
+                {
+                    case "Running": st.State = TailscaleState.Running; break;
+                    case "NeedsLogin":
+                    case "NeedsMachineAuth": st.State = TailscaleState.SignedOut; break;
+                    case "NoState":
+                    case "Starting": st.State = TailscaleState.Starting; break;
+                    default: st.State = TailscaleState.Stopped; break;
+                }
+
+                int selfStart, selfEnd;
+                if (FindObject(statusJson, "Self", out selfStart, out selfEnd))
+                {
+                    st.DnsName = (ReadString(statusJson, "DNSName", selfStart, selfEnd) ?? "").TrimEnd('.');
+                    st.HostName = ReadString(statusJson, "HostName", selfStart, selfEnd) ?? "";
+                    st.IPv4 = FirstIPv4(statusJson, "TailscaleIPs", selfStart, selfEnd) ?? "";
+                }
+            }
+            catch
+            {
+                return new TailscaleStatus();
+            }
+            return st;
+        }
+
+        /// <summary>
+        /// Asks the Tailscale CLI (hidden, at most <paramref name="timeoutMs"/>), falling back to the network adapter
+        /// when the CLI is missing, hangs or prints something unexpected. Call it off the UI thread.
+        /// </summary>
+        public static TailscaleStatus Query(string cliPath = null, int timeoutMs = 3000)
+        {
+            string cli = cliPath ?? DefaultCliPath;
+            bool installed = false;
+            try { installed = File.Exists(cli); } catch { }
+            if (installed)
+            {
+                string json = RunCli(cli, "status --json", timeoutMs);
+                if (json != null && json.IndexOf("\"BackendState\"", StringComparison.Ordinal) >= 0)
+                {
+                    return Parse(json);
+                }
+            }
+            return FromAdapter(installed);
+        }
+
+        private static string RunCli(string cli, string arguments, int timeoutMs)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(cli, arguments)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    Task<string> output = p.StandardOutput.ReadToEndAsync();
+                    Task<string> errors = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(timeoutMs))
+                    {
+                        try { p.Kill(); } catch { }
+                        return null;
+                    }
+                    return output.Wait(1000) ? output.Result : null;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static TailscaleStatus FromAdapter(bool cliInstalled)
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.Name.IndexOf("Tailscale", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        ni.Description.IndexOf("Tailscale", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    foreach (UnicastIPAddressInformation a in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        string ip = a.Address.ToString();
+                        if (!IsTailscaleAddress(ip)) continue;
+                        return new TailscaleStatus
+                        {
+                            State = ni.OperationalStatus == OperationalStatus.Up ? TailscaleState.Running : TailscaleState.Stopped,
+                            HostName = Environment.MachineName,
+                            IPv4 = ip
+                        };
+                    }
+                    return new TailscaleStatus { State = TailscaleState.Stopped, HostName = Environment.MachineName };
+                }
+            }
+            catch { }
+            return new TailscaleStatus { State = cliInstalled ? TailscaleState.Stopped : TailscaleState.NotInstalled };
+        }
+
+        // ---- tiny JSON reading for a few known keys ----
+
+        private static int ValueStart(string json, string key, int from, int to)
+        {
+            string quoted = "\"" + key + "\"";
+            int i = from;
+            while (true)
+            {
+                i = json.IndexOf(quoted, i, Math.Max(0, to - i), StringComparison.Ordinal);
+                if (i < 0) return -1;
+                int j = i + quoted.Length;
+                while (j < to && char.IsWhiteSpace(json[j])) j++;
+                if (j < to && json[j] == ':')
+                {
+                    j++;
+                    while (j < to && char.IsWhiteSpace(json[j])) j++;
+                    return j;
+                }
+                i = j;
+            }
+        }
+
+        private static string ReadString(string json, string key, int from, int to)
+        {
+            int i = ValueStart(json, key, from, to);
+            if (i < 0 || i >= to || json[i] != '"') return null;
+            return ReadQuoted(json, i, out i);
+        }
+
+        private static string ReadQuoted(string json, int quoteIndex, out int after)
+        {
+            StringBuilder sb = new StringBuilder();
+            int i = quoteIndex + 1;
+            while (i < json.Length && json[i] != '"')
+            {
+                if (json[i] == '\\' && i + 1 < json.Length) { i++; }
+                sb.Append(json[i]);
+                i++;
+            }
+            after = i + 1;
+            return sb.ToString();
+        }
+
+        private static bool FindObject(string json, string key, out int start, out int end)
+        {
+            start = end = -1;
+            int i = ValueStart(json, key, 0, json.Length);
+            if (i < 0 || i >= json.Length || json[i] != '{') return false;
+            int depth = 0;
+            for (int j = i; j < json.Length; j++)
+            {
+                char c = json[j];
+                if (c == '"') { ReadQuoted(json, j, out j); j--; continue; }
+                if (c == '{') depth++;
+                else if (c == '}' && --depth == 0)
+                {
+                    start = i;
+                    end = j;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static string FirstIPv4(string json, string key, int from, int to)
+        {
+            int i = ValueStart(json, key, from, to);
+            if (i < 0 || i >= to || json[i] != '[') return null;
+            for (int j = i + 1; j < to && json[j] != ']'; j++)
+            {
+                if (json[j] != '"') continue;
+                string ip = ReadQuoted(json, j, out j);
+                j--;
+                IPAddress addr;
+                if (IPAddress.TryParse(ip, out addr) && addr.AddressFamily == AddressFamily.InterNetwork) return ip;
+            }
+            return null;
+        }
+    }
 }

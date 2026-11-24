@@ -1,0 +1,12 @@
+{
+  "Version": "1.104.7-t0000",
+  "BackendState": "NeedsLogin",
+  "AuthURL": "https://login.tailscale.com/a/example",
+  "TailscaleIPs": null,
+  "Self": {
+    "HostName": "OFFICE-PC",
+    "DNSName": "",
+    "TailscaleIPs": null,
+    "Online": false
+  }
+}

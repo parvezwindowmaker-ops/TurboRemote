@@ -1,0 +1,28 @@
+{
+  "Version": "1.104.7-t0000",
+  "TUN": true,
+  "BackendState": "Running",
+  "AuthURL": "",
+  "Peer": {
+    "nodekey:def": {
+      "ID": "n2",
+      "HostName": "OTHER",
+      "DNSName": "other.tail0000.ts.net.",
+      "TailscaleIPs": ["100.90.1.2", "fd7a::2"],
+      "Online": true
+    }
+  },
+  "TailscaleIPs": ["100.101.102.103", "fd7a::1"],
+  "Self": {
+    "ID": "n1",
+    "PublicKey": "nodekey:abc",
+    "HostName": "OFFICE-PC",
+    "DNSName": "office-pc.tail0000.ts.net.",
+    "OS": "windows",
+    "TailscaleIPs": ["100.101.102.103", "fd7a::1"],
+    "Tags": { "example": "{nested braces}" },
+    "Online": true
+  },
+  "MagicDNSSuffix": "tail0000.ts.net",
+  "CurrentTailnet": { "Name": "example.com", "MagicDNSSuffix": "tail0000.ts.net", "MagicDNSEnabled": true }
+}
