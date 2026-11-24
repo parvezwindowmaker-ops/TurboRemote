@@ -2192,6 +2192,113 @@ namespace TurboCore
         }
     }
 
+    /// <summary>Per-user settings in %LOCALAPPDATA%\TurboRemote\settings.txt, one "key=value" per line.</summary>
+    public static class TurboSettings
+    {
+        private static readonly object _lock = new object();
+
+        /// <summary>Tests only: use this file instead of the per-user one.</summary>
+        public static string FilePathOverride;
+
+        public static string FilePath
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(FilePathOverride)) return FilePathOverride;
+                return Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote"), "settings.txt");
+            }
+        }
+
+        public static string Get(string key, string defaultValue)
+        {
+            lock (_lock)
+            {
+                string value;
+                return ReadAll().TryGetValue(key, out value) ? value : defaultValue;
+            }
+        }
+
+        public static void Set(string key, string value)
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    Dictionary<string, string> all = ReadAll();
+                    all[key] = value;
+                    Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
+                    StringBuilder sb = new StringBuilder();
+                    foreach (KeyValuePair<string, string> kv in all) sb.Append(kv.Key).Append('=').Append(kv.Value).Append("\r\n");
+                    File.WriteAllText(FilePath, sb.ToString());
+                }
+                catch { }
+            }
+        }
+
+        private static Dictionary<string, string> ReadAll()
+        {
+            Dictionary<string, string> all = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (!File.Exists(FilePath)) return all;
+                foreach (string line in File.ReadAllLines(FilePath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq > 0) all[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+            }
+            catch { }
+            return all;
+        }
+    }
+
+    /// <summary>
+    /// Decides whether the Host's public pinggy tunnel should be open. "on"/"off" are fixed; "auto" keeps it off
+    /// while Tailscale runs (the permanent route), and opens it when Tailscale is missing or has been down for
+    /// two checks in a row. Right after sign-in, a Tailscale that is still starting gets 60 s to come up.
+    /// </summary>
+    public sealed class TunnelAutoSwitch
+    {
+        private static readonly TimeSpan StartupGrace = TimeSpan.FromSeconds(60);
+        private readonly string _setting;
+        private bool _decided, _open;
+        private int _notRunningChecks;
+
+        public TunnelAutoSwitch(string setting)
+        {
+            string s = (setting ?? "").Trim().ToLowerInvariant();
+            _setting = s == "on" || s == "off" ? s : "auto";
+        }
+
+        public bool IsAutomatic { get { return _setting == "auto"; } }
+
+        public bool Update(TailscaleState state, TimeSpan sinceHostStart)
+        {
+            if (_setting == "on") return true;
+            if (_setting == "off") return false;
+
+            if (state == TailscaleState.Running)
+            {
+                _decided = true;
+                _open = false;
+                _notRunningChecks = 0;
+                return false;
+            }
+
+            if (!_decided)
+            {
+                if (state == TailscaleState.Starting && sinceHostStart < StartupGrace) return false;
+                _decided = true;
+                _open = true;
+                return true;
+            }
+
+            _notRunningChecks++;
+            if (_notRunningChecks >= 2) _open = true;
+            return _open;
+        }
+    }
+
     public enum TailscaleState { NotInstalled, Stopped, SignedOut, Starting, Running }
 
     /// <summary>What Tailscale reports about this PC. Strings are empty when unknown.</summary>
