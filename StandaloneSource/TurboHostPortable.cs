@@ -785,6 +785,12 @@ namespace TurboHost
         private Button _btnTailscale;
         private CheckBox _chkPublicTunnel;
         private System.Windows.Forms.Timer _tailscaleTimer;
+        // A tunnel start is under way (its key is being made off the UI thread): a second start waits for it.
+        private bool _tunnelStarting;
+        // Tunnel problems already shown since the tunnel last worked: retries every 5 s or 30 s repeat them otherwise.
+        private readonly HashSet<string> _tunnelProblemsLogged = new HashSet<string>();
+        // A viewer has this long to answer the sign-in challenge.
+        private const int SignInTimeoutMs = 20000;
 
         public HostMainForm()
         {
@@ -920,10 +926,18 @@ namespace TurboHost
             _lblTailscale = new Label
             {
                 Text = "Tailscale: checking…",
-                Location = new Point(16, 104),
-                Size = new Size(580, 22),
+                Location = new Point(16, 97),
+                Size = new Size(470, 36),
                 TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = Color.FromArgb(170, 185, 210)
+            };
+
+            // Tailscale is re-read every 30 s; this is for right after signing in to it or starting it.
+            Button btnCheckTailscale = CreateButton("↻ Check again", 492, 100, 104, 28, Color.FromArgb(55, 70, 100));
+            btnCheckTailscale.Click += async (s, e) =>
+            {
+                await RefreshTailscaleAsync();
+                Log("[Tailscale] Checked again: " + _lblTailscale.Text);
             };
 
             _btnTailscale = CreateButton("📋 Copy name", 602, 100, 110, 28, Color.FromArgb(45, 95, 110));
@@ -941,7 +955,7 @@ namespace TurboHost
             _chkPublicTunnel.CheckedChanged += (s, e) => OnPublicTunnelBoxChanged();
             UpdateTunnelBox();
 
-            grpConnect.Controls.AddRange(new Control[] { lblHostId, lblHostIdValue, _lblLan, btnCopyHostId, lblPin, _txtPin, btnGenKey, _lblTailscale, _btnTailscale, _chkPublicTunnel });
+            grpConnect.Controls.AddRange(new Control[] { lblHostId, lblHostIdValue, _lblLan, btnCopyHostId, lblPin, _txtPin, btnGenKey, _lblTailscale, btnCheckTailscale, _btnTailscale, _chkPublicTunnel });
             Controls.Add(grpConnect);
 
             _btnStartStop = CreateButton("▶ Start sharing", 16, 278, 170, 34, Color.FromArgb(34, 155, 95));
@@ -1190,11 +1204,9 @@ namespace TurboHost
             switch (st.State)
             {
                 case TailscaleState.Running:
-                    string where = string.IsNullOrEmpty(st.DnsName) ? st.IPv4 : st.DnsName + " · " + st.IPv4;
-                    string name = string.IsNullOrEmpty(st.HostName) ? Environment.MachineName : st.HostName;
-                    _lblTailscale.Text = "Tailscale ON — from anywhere, connect to: " + name + "  (" + where + ")";
+                    _lblTailscale.Text = TailscaleInfo.HostLine(st, Environment.MachineName);
                     _lblTailscale.ForeColor = Color.FromArgb(120, 235, 170);
-                    _btnTailscale.Text = "📋 Copy Tailscale name";
+                    _btnTailscale.Text = "📋 Copy name";
                     _btnTailscale.Visible = true;
                     break;
                 case TailscaleState.Starting:
@@ -1220,7 +1232,7 @@ namespace TurboHost
         {
             if (_tailscale.IsRunning)
             {
-                string name = string.IsNullOrEmpty(_tailscale.DnsName) ? _tailscale.IPv4 : _tailscale.DnsName;
+                string name = _tailscale.ConnectName;
                 try { Clipboard.SetText(name); } catch { }
                 Log("[Tailscale] Copied " + name + ". On any PC in your Tailscale account, type it (or just the Host ID) in the viewer.");
                 return;
@@ -1291,36 +1303,60 @@ namespace TurboHost
             _tunnelSwitch = new TunnelAutoSwitch(setting);
             _tunnelWanted = _tunnelSwitch.Update(_tailscale.State, _hostClock.Elapsed);
             Log("[Auto-Tunnel] Public tunnel set to " + setting + " (saved for the next start).");
+            ResetTunnelProblems(); // the user acted: tell them again what stands in the way
             ApplyTunnelPolicy();
             UpdateTunnelBox();
         }
 
+        /// <summary>
+        /// UI thread. Starts the tunnel if it is wanted and not running. Making its key can take seconds on first
+        /// use, so that happens on a worker thread; meanwhile further starts are ignored. (Waiting on the UI thread
+        /// let a second start slip in, and the first ssh.exe was then orphaned.)
+        /// </summary>
         private void StartBuiltInPublicSshTunnel()
         {
-            try
+            if (InvokeRequired)
             {
-                if (_tunnelProc != null && !_tunnelProc.HasExited)
-                {
-                    return;
-                }
+                try { BeginInvoke(new Action(StartBuiltInPublicSshTunnel)); } catch (InvalidOperationException) { }
+                return;
+            }
+            if (_tunnelStarting || IsTunnelRunning()) return;
 
-                // Opening the tunnel exposes the key check to the whole Internet, and with Tailscale running it
-                // only adds a route that dies every hour.
-                if (!WantTunnel())
-                {
-                    return;
-                }
+            // Opening the tunnel exposes the key check to the whole Internet, and with Tailscale running it
+            // only adds a route that dies every hour.
+            if (!WantTunnel()) return;
 
-                int port = _port;
-
+            _tunnelStarting = true;
+            Task.Run(() =>
+            {
                 string keyError;
                 string keyPath = PublicTunnel.EnsureTunnelKey(out keyError);
-                if (keyPath == null)
-                {
-                    Log("[Auto-Tunnel] Could not create the SSH key the tunnel signs in with (" + keyError + "). Make sure the Windows 'OpenSSH Client' optional feature is installed.");
-                    return;
-                }
+                try { BeginInvoke(new Action(() => LaunchTunnelProcess(keyPath, keyError))); }
+                catch (InvalidOperationException) { } // the window is closing
+            });
+        }
 
+        private bool IsTunnelRunning()
+        {
+            try { return _tunnelProc != null && !_tunnelProc.HasExited; } catch { return false; }
+        }
+
+        /// <summary>UI thread. Second half of <see cref="StartBuiltInPublicSshTunnel"/>, once the key is there.</summary>
+        private void LaunchTunnelProcess(string keyPath, string keyError)
+        {
+            _tunnelStarting = false;
+            // Things may have changed while the key was made: sharing stopped, box unticked, key weakened.
+            if (IsDisposed || !_isRunning || IsTunnelRunning() || !WantTunnel()) return;
+
+            if (keyPath == null)
+            {
+                LogTunnelProblemOnce("[Auto-Tunnel] Could not create the SSH key the tunnel signs in with (" + keyError + "). Make sure the Windows 'OpenSSH Client' optional feature is installed.");
+                return;
+            }
+
+            try
+            {
+                int port = _port;
                 Log("[Auto-Tunnel] Starting background OpenSSH Public Internet TCP Relay for local port " + port + "...");
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
@@ -1353,12 +1389,27 @@ namespace TurboHost
             }
             catch (System.ComponentModel.Win32Exception ex)
             {
-                Log("[Auto-Tunnel] Could not start ssh.exe (" + ex.Message + "). Install the Windows 'OpenSSH Client' optional feature.");
+                LogTunnelProblemOnce("[Auto-Tunnel] Could not start ssh.exe (" + ex.Message + "). Install the Windows 'OpenSSH Client' optional feature.");
             }
             catch (Exception ex)
             {
-                Log("[Auto-Tunnel] Background SSH tunnel note: " + ex.Message);
+                LogTunnelProblemOnce("[Auto-Tunnel] Background SSH tunnel note: " + ex.Message);
             }
+        }
+
+        /// <summary>Any thread. Logs a tunnel problem unless it was already shown since the tunnel last worked.</summary>
+        private void LogTunnelProblemOnce(string message)
+        {
+            lock (_tunnelProblemsLogged)
+            {
+                if (!_tunnelProblemsLogged.Add(message)) return;
+            }
+            Log(message);
+        }
+
+        private void ResetTunnelProblems()
+        {
+            lock (_tunnelProblemsLogged) { _tunnelProblemsLogged.Clear(); }
         }
 
         private void OnTunnelExited(Process proc)
@@ -1381,14 +1432,15 @@ namespace TurboHost
                 // Closed on purpose (weak key, Tailscale running, box unticked): nothing to restart.
                 if (!WantTunnel()) return;
 
-                Log("[Auto-Tunnel] Tunnel closed; reconnecting in 5 seconds...");
+                LogTunnelProblemOnce("[Auto-Tunnel] Tunnel closed; reconnecting in 5 seconds...");
                 CancellationToken token = cts.Token;
                 Task.Run(async () =>
                 {
                     try
                     {
                         await Task.Delay(5000, token);
-                        if (_isRunning && !token.IsCancellationRequested) StartBuiltInPublicSshTunnel();
+                        // Every start happens on the UI thread: one started from here could race one from there.
+                        if (_isRunning && !token.IsCancellationRequested && !IsDisposed) BeginInvoke(new Action(ApplyTunnelPolicy));
                     }
                     catch { }
                 });
@@ -1414,10 +1466,11 @@ namespace TurboHost
                     Log("[Auto-Tunnel] Free pinggy tunnel: its address changes every 60 minutes; TurboRemote reconnects and re-publishes it automatically.");
                     return;
                 }
-                Log("[Auto-Tunnel] " + line.Trim());
+                LogTunnelProblemOnce("[Auto-Tunnel] " + line.Trim());
                 return;
             }
 
+            ResetTunnelProblems(); // it works: show the next problem when it comes
             if (_activePublicTunnelEndpoint == endpoint) return;
             _activePublicTunnelEndpoint = endpoint;
             Log("[PUBLIC INTERNET TUNNEL ACTIVE] -> " + endpoint);
@@ -1670,8 +1723,25 @@ namespace TurboHost
                     Buffer.BlockCopy(challenge16, 0, challengePayload, 16, 16);
                     await TurboProtocol.SendPacketAsync(stream, writeLock, PacketType.AuthChallenge, challengePayload, ct);
 
-                    // 2. Read Zero-Knowledge HMAC Proof from Client (PIN never sent in cleartext!)
-                    KeyValuePair<PacketType, byte[]>? authPacket = await TurboProtocol.ReadPacketAsync(stream, ct);
+                    // 2. Read Zero-Knowledge HMAC Proof from Client (PIN never sent in cleartext!). A connection that
+                    //    never answers is closed: it used to stay for ever, and through the tunnel it also kept a
+                    //    tunnel the Host wanted closed open. (A pending read ignores its token, so close the socket.)
+                    KeyValuePair<PacketType, byte[]>? authPacket;
+                    using (CancellationTokenSource signIn = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    using (signIn.Token.Register(() => { try { client.Close(); } catch { } }))
+                    {
+                        signIn.CancelAfter(SignInTimeoutMs);
+                        try
+                        {
+                            authPacket = await TurboProtocol.ReadPacketAsync(stream, signIn.Token);
+                        }
+                        catch (Exception)
+                        {
+                            if (!signIn.IsCancellationRequested || ct.IsCancellationRequested) throw;
+                            Log("[Security] " + remoteEp + " did not sign in within " + (SignInTimeoutMs / 1000) + " s; connection closed.");
+                            return;
+                        }
+                    }
                     if (authPacket == null || authPacket.Value.Key != PacketType.AuthResponse || authPacket.Value.Value.Length != 32)
                     {
                         Log("[Security] Malformed challenge response from " + remoteEp);

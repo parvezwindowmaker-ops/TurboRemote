@@ -3,7 +3,10 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using TurboCore;
@@ -22,7 +25,8 @@ class RouteRaceTests
         _tokens.Add(token);
         string[] parts = c.Host.Split('-');
         if (parts[0] == "never") { await Task.Delay(Timeout.Infinite, token); }
-        await Task.Delay(int.Parse(parts[1]), token);
+        // "ok-50.run.pinggy.link" is a tunnel host that connects after 50 ms.
+        await Task.Delay(int.Parse(new string(parts[1].TakeWhile(char.IsDigit).ToArray())), token);
         if (parts[0] == "fail") throw new Exception("dial failed: " + c.Host);
         return new TcpClient();
     }
@@ -45,6 +49,50 @@ class RouteRaceTests
         catch (AggregateException ex) { error = ex.InnerException; }
         elapsedMs = _clock.ElapsedMilliseconds;
         return winner;
+    }
+
+    /// <summary>Runs one race on <paramref name="ct"/> and returns a weak handle on its internal token source.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static WeakReference RaceOnToken(CancellationToken ct)
+    {
+        ConnectionRace race = NewRace();
+        race.AddDirect(C("ok-20"));
+        long ms; Exception err;
+        Run(race, ct, out ms, out err);
+        return new WeakReference(typeof(ConnectionRace).GetField("_raceCts", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(race));
+    }
+
+    /// <summary>
+    /// A route answers at the very moment the user cancels: the race is already cancelled, so its connection
+    /// must be closed, not left open. Returns how many of <paramref name="rounds"/> stayed open.
+    /// </summary>
+    static int WinnersLeftOpenAfterCancel(int rounds)
+    {
+        TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        int open = 0;
+        for (int i = 0; i < rounds; i++)
+        {
+            CancellationTokenSource outer = new CancellationTokenSource();
+            ConnectionRace race = new ConnectionRace(async (c, token) =>
+            {
+                TcpClient tcp = new TcpClient();
+                await tcp.ConnectAsync(IPAddress.Loopback, port);
+                outer.Cancel(); // Stop, just as this route answers
+                return tcp;
+            });
+            race.AddDirect(C("x-0"));
+            try { race.RunAsync(outer.Token).Wait(); } catch { }
+            using (Socket accepted = listener.AcceptSocket())
+            {
+                accepted.ReceiveTimeout = 1500;
+                try { if (accepted.Receive(new byte[1]) != 0) open++; }
+                catch (SocketException) { open++; } // nothing arrived and nobody closed it
+            }
+        }
+        listener.Stop();
+        return open;
     }
 
     static int Main(string[] args)
@@ -104,6 +152,31 @@ class RouteRaceTests
         TestKit.Check("cancel stops the race and every dial",
             err is OperationCanceledException && ms < 800 && _tokens.All(t => t.IsCancellationRequested),
             (err != null ? err.GetType().Name : "none") + " at " + ms + " ms, " + _tokens.Count(t => t.IsCancellationRequested) + "/" + _tokens.Count + " dials cancelled");
+
+        CancellationTokenSource longLived = new CancellationTokenSource();
+        WeakReference raceCts = RaceOnToken(longLived.Token);
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        TestKit.Check("a finished race leaves nothing registered on the caller's long-lived token", !raceCts.IsAlive,
+            "the race's token source is still reachable from the caller's token");
+        GC.KeepAlive(longLived);
+
+        int leftOpen = WinnersLeftOpenAfterCancel(10);
+        TestKit.Check("a connection that wins just as the race is cancelled is closed", leftOpen == 0, leftOpen + " of 10 left open");
+
+        // What the user typed: a tunnel address alone was chosen on purpose and is dialled at once. In a list (a
+        // pasted ticket, or a reconnect's "typed,machineName") it waits its turn like any other tunnel route.
+        ConnectionRace typedAlone = NewRace();
+        SmartRouteEngine.AddTypedCandidates(typedAlone, "ok-50.run.pinggy.link", 1);
+        typedAlone.NoMoreCandidates();
+        won = Run(typedAlone, CancellationToken.None, out ms, out err);
+        TestKit.Check("a tunnel address typed alone is dialled at once", won == "ok-50.run.pinggy.link" && ms < 1000, "winner " + won + " at " + ms + " ms");
+
+        ConnectionRace typedList = NewRace();
+        SmartRouteEngine.AddTypedCandidates(typedList, "ok-400, ok-50.run.pinggy.link", 1);
+        typedList.NoMoreCandidates();
+        won = Run(typedList, CancellationToken.None, out ms, out err);
+        TestKit.Check("in a list, a tunnel address waits for the direct routes", won == "ok-400" && !_started.ContainsKey("ok-50.run.pinggy.link"),
+            "winner " + won + " at " + ms + " ms; tunnel dialled: " + _started.ContainsKey("ok-50.run.pinggy.link"));
 
         TestKit.Check("pinggy hosts are public tunnels",
             SmartRouteEngine.IsPublicTunnelHost("abc.run.pinggy-free.link") && SmartRouteEngine.IsPublicTunnelHost("abc.A.Pinggy.Link") &&

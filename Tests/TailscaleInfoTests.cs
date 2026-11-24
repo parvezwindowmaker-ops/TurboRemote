@@ -20,6 +20,19 @@ class TailscaleInfoTests
         TestKit.Check("Running fixture: host name of this PC, not the peer's", running.HostName == "OFFICE-PC", running.HostName);
         TestKit.Check("Running fixture: first IPv4 of this PC", running.IPv4 == "100.101.102.103", running.IPv4);
 
+        // MagicDNS can be switched off in a tailnet; then names do not resolve and only the address works.
+        TestKit.Check("Running fixture: MagicDNS on, so the name is what to connect to",
+            running.MagicDnsEnabled && running.ConnectName == "office-pc.tail0000.ts.net", running.ConnectName);
+        TailscaleStatus noDns = TailscaleInfo.Parse(Fixture("nomagicdns"));
+        TestKit.Check("MagicDNS off: the address is what to connect to (and what Copy copies)",
+            !noDns.MagicDnsEnabled && noDns.ConnectName == "100.101.102.103", noDns.MagicDnsEnabled + " " + noDns.ConnectName);
+        string offLine = TailscaleInfo.HostLine(noDns, "OFFICE-PC");
+        TestKit.Check("MagicDNS off: the Host line offers the address, not names that will not resolve",
+            offLine.Contains("connect to: 100.101.102.103") && !offLine.Contains(".ts.net") && !offLine.Contains("OFFICE-PC"), offLine);
+        string onLine = TailscaleInfo.HostLine(running, "OFFICE-PC");
+        TestKit.Check("MagicDNS on: the Host line offers the Host ID and the full name",
+            onLine.Contains("connect to: OFFICE-PC") && onLine.Contains("office-pc.tail0000.ts.net") && onLine.Contains("100.101.102.103"), onLine);
+
         TestKit.Check("NeedsLogin -> SignedOut", TailscaleInfo.Parse(Fixture("needslogin")).State == TailscaleState.SignedOut, null);
         TestKit.Check("NoState -> Starting", TailscaleInfo.Parse(Fixture("starting")).State == TailscaleState.Starting, null);
         TailscaleStatus garbage = TailscaleInfo.Parse("garbage");

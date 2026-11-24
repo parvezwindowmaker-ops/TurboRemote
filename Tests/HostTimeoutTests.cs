@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Linq;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using TurboCore;
@@ -19,6 +20,23 @@ class HostTimeoutTests
             TestKit.WaitUntil(() => { try { a = FakeViewer.Connect("127.0.0.1", port, "2580"); return true; } catch { return false; } }, 20000, 500);
             if (a == null) { TestKit.Check("viewer A can connect to the Host", false, null); return TestKit.Summary(); }
             FakeViewer c = FakeViewer.Connect("127.0.0.1", port, "2580");
+
+            // A connection that takes the challenge and never answers it (a port scanner, a stuck client). Through
+            // the tunnel it also kept a tunnel the Host no longer wants open, for ever.
+            Task<long> mute = Task.Run(() =>
+            {
+                using (TcpClient raw = new TcpClient())
+                {
+                    raw.Connect("127.0.0.1", port);
+                    NetworkStream ns = raw.GetStream();
+                    ns.ReadTimeout = 60000;
+                    Stopwatch open = Stopwatch.StartNew();
+                    byte[] buf = new byte[4096];
+                    try { while (ns.Read(buf, 0, buf.Length) > 0) { } }
+                    catch { return -1L; } // still open after 60 s
+                    return open.ElapsedMilliseconds;
+                }
+            });
 
             CancellationTokenSource stopC = new CancellationTokenSource();
             Task cPings = Task.Run(() =>
@@ -61,6 +79,12 @@ class HostTimeoutTests
             TestKit.Check("...and the Host log says so", siblingLine != null, siblingLine);
             f.Dispose();
             e.Dispose();
+
+            long muteClosedAfter = mute.Wait(70000) ? mute.Result : -1;
+            TestKit.Check("a connection that never signs in is closed after 20 s", muteClosedAfter >= 18000 && muteClosedAfter <= 30000,
+                muteClosedAfter < 0 ? "still open after 60 s" : "closed after " + muteClosedAfter + " ms");
+            string muteLine = Uia.ListItems(Uia.Window(host)).FirstOrDefault(l => l.Contains("did not sign in"));
+            TestKit.Check("...and the Host log says so", muteLine != null, muteLine);
 
             stopC.Cancel();
             cPings.Wait(3000);

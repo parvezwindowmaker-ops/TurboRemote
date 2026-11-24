@@ -234,7 +234,7 @@ namespace TurboUnified
                     string topic, secret, otherTopic, otherSecret;
                     SmartRouteEngine.DeriveCloudDirectory("wm-dev-07 ", strongKey, out topic, out secret);
                     SmartRouteEngine.DeriveCloudDirectory("WM-DEV-07", strongKey + "X", out otherTopic, out otherSecret);
-                    if (!topic.StartsWith("https://ntfy.sh/trbo2_") || topic == otherTopic || secret == otherSecret || topic.Contains(secret))
+                    if (!topic.StartsWith(TurboPaths.CloudDirectoryUrl + "trbo2_") || topic == otherTopic || secret == otherSecret || topic.Contains(secret))
                         throw new Exception("Cloud directory derivation wrong.");
                     string sealedTicket = SmartRouteEngine.EncryptTicketForCloud("192.168.1.5:9876,abc.run.pinggy-free.link:4321", secret);
                     if (SmartRouteEngine.DecryptTicketFromCloud(sealedTicket, secret) != "192.168.1.5:9876,abc.run.pinggy-free.link:4321")

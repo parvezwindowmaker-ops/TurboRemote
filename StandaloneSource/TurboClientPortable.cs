@@ -312,6 +312,11 @@ namespace TurboClient
 
         private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
 
+        // The title while not connected. "Connected -> X" used to stay up while reconnecting and after Stop.
+        private static readonly string BaseTitle = "TurboRemote — Viewer Client  v" + TurboProtocol.AppVersion;
+        // The reconnect banner last drawn: the canvas is repainted only when it changes (once a second at most).
+        private string _lastBannerText;
+
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
@@ -320,7 +325,7 @@ namespace TurboClient
 
         public ClientMainForm()
         {
-            Text = "TurboRemote — Viewer Client  v" + TurboProtocol.AppVersion;
+            Text = BaseTitle;
             Size = new Size(1250, 800);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 24);
@@ -348,6 +353,7 @@ namespace TurboClient
             _txtHostIp = new TextBox
             {
                 Text = "AUTO",
+                AccessibleName = "Host ID or address",
                 Location = new Point(140, 10),
                 Width = 200,
                 BackColor = Color.FromArgb(16, 18, 26),
@@ -361,6 +367,7 @@ namespace TurboClient
             _txtPin = new TextBox
             {
                 Text = "",
+                AccessibleName = "Access key",
                 Location = new Point(432, 10),
                 Width = 150,
                 BackColor = Color.FromArgb(16, 18, 26),
@@ -817,7 +824,7 @@ namespace TurboClient
                     challengePkt = await TurboProtocol.ReadPacketAsync(_stream, handshake.Token);
                     if (challengePkt == null || challengePkt.Value.Key != PacketType.AuthChallenge || challengePkt.Value.Value.Length != 32)
                     {
-                        CloseSessionSocket();
+                        CloseAttemptSocket(client);
                         throw new Exception("Host did not send valid 32-byte cryptographic challenge.");
                     }
 
@@ -837,17 +844,21 @@ namespace TurboClient
                 catch (Exception ex)
                 {
                     bool timedOut = handshake.IsCancellationRequested && !_sessionCts.IsCancellationRequested;
-                    CloseSessionSocket();
+                    CloseAttemptSocket(client);
                     if (timedOut) throw new TimeoutException("The Host did not answer the sign-in in time.");
                     if (connectCt.IsCancellationRequested) throw new OperationCanceledException(connectCt);
                     throw new Exception("Sign-in was interrupted: " + ex.Message, ex);
                 }
             }
-            connectCt.ThrowIfCancellationRequested();
+            if (connectCt.IsCancellationRequested)
+            {
+                CloseAttemptSocket(client);
+                throw new OperationCanceledException(connectCt);
+            }
 
             if (authResp == null || authResp.Value.Key != PacketType.AuthResult)
             {
-                CloseSessionSocket();
+                CloseAttemptSocket(client);
                 throw new Exception("Host closed connection during cryptographic handshake.");
             }
 
@@ -856,7 +867,7 @@ namespace TurboClient
             string checkClear = Encoding.UTF8.GetString(rawPayload);
             if (checkClear.StartsWith("FAIL:"))
             {
-                CloseSessionSocket();
+                CloseAttemptSocket(client);
                 string why = "Authentication rejected (" + checkClear + ")";
                 // "Busy" means try later; anything else is the key itself, and retrying it trips the lockout.
                 if (checkClear.IndexOf("busy", StringComparison.OrdinalIgnoreCase) >= 0) throw new Exception(why);
@@ -866,7 +877,7 @@ namespace TurboClient
             string authText = Encoding.UTF8.GetString(_sec.VerifyAndDecrypt(PacketType.AuthResult, rawPayload));
             if (!authText.StartsWith("OK|"))
             {
-                CloseSessionSocket();
+                CloseAttemptSocket(client);
                 throw new Exception("Authentication verification failed.");
             }
 
@@ -878,7 +889,7 @@ namespace TurboClient
 
             if (expectedMachine != null && !string.Equals(remoteMachine, expectedMachine, StringComparison.OrdinalIgnoreCase))
             {
-                CloseSessionSocket();
+                CloseAttemptSocket(client);
                 throw new WrongHostException("A different PC (" + remoteMachine + ") answered instead of " + expectedMachine + ".");
             }
 
@@ -898,7 +909,19 @@ namespace TurboClient
             await SendStreamConfigAsync();
             await RequestRemoteFileListAsync("DEFAULT");
 
-            // Give the remote view keyboard focus so typing goes to the host right away.
+            // Stop or Cancel clicked while the session was being set up: leave nothing half-connected behind (it
+            // used to stay "connected" with a dead receive loop, and its dead link later restarted reconnecting).
+            if (connectCt.IsCancellationRequested)
+            {
+                string status = _lblTelemetry.Text;
+                Color statusColor = _lblTelemetry.ForeColor;
+                if (ReferenceEquals(_tcpClient, client)) EndSession();
+                else CloseAttemptSocket(client);
+                _lblTelemetry.Text = status;
+                _lblTelemetry.ForeColor = statusColor;
+                throw new OperationCanceledException(connectCt);
+            }
+
             _screenCanvas.CaptureAllKeys = true;
             if (_keyboardHook == null)
             {
@@ -907,7 +930,10 @@ namespace TurboClient
             if (_tabControl.SelectedIndex == 0)
             {
                 if (_screenCanvas.Focused) await SendLockKeyStateAsync();
-                else _screenCanvas.Focus();
+                // A new session takes the keyboard so typing goes to the Host right away. A reconnect does not:
+                // the user may have moved into the address or key box during the outage, and their next keys
+                // would land on the remote PC.
+                else if (expectedMachine == null) _screenCanvas.Focus();
             }
 
             // Hand this session's stream/keys/token to its loop, so it can never pick up a later session's.
@@ -923,6 +949,21 @@ namespace TurboClient
             if (_isReconnecting) StopReconnecting(null);
             _reconnectTarget = null;
             EndSession();
+        }
+
+        /// <summary>
+        /// Closes a failed or abandoned attempt's own connection. While the shared session fields still belong to
+        /// it, they are cleared too; once a later Connect owns them, only the attempt's socket is closed.
+        /// </summary>
+        private void CloseAttemptSocket(TcpClient attempt)
+        {
+            if (attempt == null) return;
+            if (ReferenceEquals(_tcpClient, attempt))
+            {
+                if (!_isConnected) CloseSessionSocket();
+                return;
+            }
+            try { attempt.Close(); } catch { }
         }
 
         /// <summary>Closes the socket and keys without touching the UI (failed sign-ins, failed reconnect attempts).</summary>
@@ -978,6 +1019,7 @@ namespace TurboClient
             try { if (oldSec != null) oldSec.Dispose(); } catch { }
 
             ResetConnectButton();
+            Text = BaseTitle;
             _lblTelemetry.Text = "● DISCONNECTED";
             _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
             ShowDisconnectedStatus();
@@ -1120,10 +1162,12 @@ namespace TurboClient
             _reconnectCts = cts;
             CancellationToken ct = cts.Token;
             _isReconnecting = true;
+            _lastBannerText = null;
             _lostClock.Restart();
             _reconnectName = string.IsNullOrEmpty(target.MachineName) ? target.HostInput : target.MachineName;
             _btnConnect.Text = "✖ Stop reconnecting";
             _btnConnect.BackColor = Color.FromArgb(195, 110, 30);
+            Text = "Reconnecting to " + _reconnectName + "… — TurboRemote";
 
             string fullDial = target.HostInput;
             bool canFallBackToName = !string.IsNullOrEmpty(target.MachineName) &&
@@ -1142,6 +1186,7 @@ namespace TurboClient
                 _reconnectAttempt = attempt;
                 string dial = nameOnlyNext ? target.MachineName : fullDial;
                 nameOnlyNext = false;
+                TcpClient attemptClient = null;
                 try
                 {
                     for (int left = ReconnectSchedule.DelayBeforeAttemptMs(attempt); left > 0; left -= 250)
@@ -1153,7 +1198,8 @@ namespace TurboClient
                     _reconnectNextInSec = 0;
                     ShowReconnectStatus();
 
-                    KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(dial, target.Port, target.Pin, ct);
+                    KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(dial, target.Port, target.Pin, ct, true);
+                    attemptClient = winner.Key;
                     await InitializeActiveSessionAsync(winner.Key, winner.Value, ct, target.MachineName, target.Pin);
 
                     if (ReferenceEquals(_reconnectCts, cts)) _reconnectCts = null;
@@ -1180,7 +1226,7 @@ namespace TurboClient
                 }
                 catch (WrongHostException)
                 {
-                    if (!_isConnected) CloseSessionSocket();
+                    CloseAttemptSocket(attemptClient);
                     if (ct.IsCancellationRequested) return;
                     if (firstRefusal != null)
                     {
@@ -1191,7 +1237,7 @@ namespace TurboClient
                 }
                 catch (Exception)
                 {
-                    if (!_isConnected) CloseSessionSocket(); // a half-finished attempt
+                    CloseAttemptSocket(attemptClient); // a half-finished attempt, never a newer Connect's socket
                     if (ct.IsCancellationRequested) return;
                     // The name led nowhere, so the refusal at the typed address stands: the key is wrong there.
                     if (firstRefusal != null)
@@ -1208,17 +1254,33 @@ namespace TurboClient
             if (!_isReconnecting) return;
             _lblTelemetry.Text = "● RECONNECTING to " + _reconnectName + " (attempt " + _reconnectAttempt + ")…";
             _lblTelemetry.ForeColor = Color.FromArgb(255, 200, 110);
-            _screenCanvas.Invalidate();
+            // Called every 250 ms; the banner text changes once a second at most, so repaint only then.
+            string banner = ReconnectBannerText();
+            if (banner != _lastBannerText)
+            {
+                _lastBannerText = banner;
+                _screenCanvas.Invalidate();
+            }
+        }
+
+        private string ReconnectBannerText()
+        {
+            return _reconnectNextInSec > 0
+                ? string.Format("Connection lost — reconnecting to {0} (attempt {1}, next try in {2} s)…", _reconnectName, _reconnectAttempt, _reconnectNextInSec)
+                : string.Format("Connection lost — reconnecting to {0} (attempt {1}, trying now)…", _reconnectName, _reconnectAttempt);
         }
 
         private void StopReconnecting(string message)
         {
             CancellationTokenSource cts = _reconnectCts;
             _reconnectCts = null;
+            // Forgotten, so nothing can restart reconnecting later (a dead link noticed after Stop used to).
+            _reconnectTarget = null;
             try { if (cts != null) cts.Cancel(); } catch { }
             if (!_isConnected) CloseSessionSocket(); // an attempt still signing in
             _isReconnecting = false;
             ResetConnectButton();
+            if (!_isConnected) Text = BaseTitle;
             if (message != null)
             {
                 _lblTelemetry.Text = message;
@@ -1262,9 +1324,7 @@ namespace TurboClient
                 {
                     using (SolidBrush dim = new SolidBrush(Color.FromArgb(150, 0, 0, 0))) e.Graphics.FillRectangle(dim, area);
                 }
-                string banner = _reconnectNextInSec > 0
-                    ? string.Format("Connection lost — reconnecting to {0} (attempt {1}, next try in {2} s)…", _reconnectName, _reconnectAttempt, _reconnectNextInSec)
-                    : string.Format("Connection lost — reconnecting to {0} (attempt {1}, trying now)…", _reconnectName, _reconnectAttempt);
+                string banner = ReconnectBannerText();
                 using (SolidBrush text = new SolidBrush(Color.FromArgb(255, 215, 140)))
                 using (Font font = new Font("Segoe UI", 13f, FontStyle.Bold))
                 {

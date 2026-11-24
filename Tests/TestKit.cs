@@ -17,18 +17,57 @@ using TurboCore;
 public static class TestKit
 {
     private static int _passes, _fails;
-    private static readonly string StateDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
-    private static bool _keyFileExisted, _settingsExisted;
 
     /// <summary>Path of the TurboRemote.exe under test (the test program's first argument).</summary>
     public static string ExePath;
 
-    /// <summary>Call first in Main: remembers which per-user files existed, so Summary can remove the rest.</summary>
+    /// <summary>
+    /// This run's own data folder (TURBOREMOTE_DATA_DIR): settings, saved access key and tunnel key go here, never
+    /// into the user's %LOCALAPPDATA%\TurboRemote. Deleted by <see cref="Summary"/>.
+    /// </summary>
+    public static string SandboxDir;
+
+    /// <summary>The fake ssh.exe and ssh-keygen.exe (TURBOREMOTE_OPENSSH_DIR): no test opens a real pinggy tunnel.</summary>
+    public static string FakeOpenSshDir;
+
+    /// <summary>A local stand-in for ntfy.sh (TURBOREMOTE_DIRECTORY_URL) for this program and every app it starts.</summary>
+    public static FakeDirectory CloudDirectory;
+
+    /// <summary>Call first in Main. Sets up the sandbox; the apps the test starts inherit it.</summary>
     public static void Init(string[] args)
     {
         ExePath = args.Length > 0 ? args[0] : "TurboRemote.exe";
-        _keyFileExisted = File.Exists(Path.Combine(StateDir, "access_key.txt"));
-        _settingsExisted = File.Exists(Path.Combine(StateDir, "settings.txt"));
+
+        string root = Path.Combine(Path.GetTempPath(), "TurboRemoteTests");
+        RemoveOldSandboxes(root);
+        SandboxDir = Path.Combine(root, Process.GetCurrentProcess().Id + "-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        FakeOpenSshDir = Path.Combine(SandboxDir, "openssh");
+        Directory.CreateDirectory(FakeOpenSshDir);
+        string fakeSsh = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FakeOpenSsh.exe");
+        if (File.Exists(fakeSsh))
+        {
+            File.Copy(fakeSsh, Path.Combine(FakeOpenSshDir, "ssh.exe"), true);
+            File.Copy(fakeSsh, Path.Combine(FakeOpenSshDir, "ssh-keygen.exe"), true);
+        }
+        CloudDirectory = new FakeDirectory();
+
+        Environment.SetEnvironmentVariable("TURBOREMOTE_DATA_DIR", SandboxDir);
+        Environment.SetEnvironmentVariable("TURBOREMOTE_OPENSSH_DIR", FakeOpenSshDir);
+        Environment.SetEnvironmentVariable("TURBOREMOTE_DIRECTORY_URL", CloudDirectory.BaseUrl);
+    }
+
+    /// <summary>Sandboxes left behind by a test that was killed, once they are a day old.</summary>
+    private static void RemoveOldSandboxes(string root)
+    {
+        try
+        {
+            if (!Directory.Exists(root)) return;
+            foreach (string dir in Directory.GetDirectories(root))
+            {
+                try { if (Directory.GetCreationTimeUtc(dir) < DateTime.UtcNow.AddDays(-1)) Directory.Delete(dir, true); } catch { }
+            }
+        }
+        catch { }
     }
 
     public static void Check(string name, bool ok, string detail = null)
@@ -37,12 +76,16 @@ public static class TestKit
         if (ok) _passes++; else _fails++;
     }
 
-    /// <summary>Prints the verdict, removes per-user files the test created, returns the exit code.</summary>
+    /// <summary>Prints the verdict, removes the sandbox, returns the exit code.</summary>
     public static int Summary()
     {
-        if (!_keyFileExisted) TryDelete(Path.Combine(StateDir, "access_key.txt"));
-        if (!_settingsExisted) TryDelete(Path.Combine(StateDir, "settings.txt"));
         Console.WriteLine(_fails == 0 ? "ALL CHECKS PASSED" : _fails + " CHECK(S) FAILED");
+        if (CloudDirectory != null) CloudDirectory.Dispose();
+        // Apps killed a moment ago may still hold their files open.
+        for (int i = 0; i < 10 && SandboxDir != null && Directory.Exists(SandboxDir); i++)
+        {
+            try { Directory.Delete(SandboxDir, true); } catch { Thread.Sleep(300); }
+        }
         return _fails == 0 ? 0 : 1;
     }
 
@@ -71,14 +114,136 @@ public static class TestKit
         return Process.Start(ExePath, arguments);
     }
 
-    public static void Kill(Process p)
+    /// <summary>Starts the app with extra environment variables (on top of the sandbox ones).</summary>
+    public static Process StartApp(string arguments, IDictionary<string, string> environment)
     {
-        try { if (p != null && !p.HasExited) p.Kill(); } catch { }
+        ProcessStartInfo psi = new ProcessStartInfo(ExePath, arguments) { UseShellExecute = false };
+        foreach (KeyValuePair<string, string> kv in environment) psi.EnvironmentVariables[kv.Key] = kv.Value;
+        return Process.Start(psi);
     }
 
-    private static void TryDelete(string path)
+    public static void Kill(Process p)
     {
-        try { if (File.Exists(path)) File.Delete(path); } catch { }
+        try { if (p != null && !p.HasExited) { p.Kill(); p.WaitForExit(3000); } } catch { }
+    }
+}
+
+/// <summary>
+/// A stand-in for ntfy.sh on 127.0.0.1: keeps what is published per topic and serves it back to "/raw" polls, and
+/// counts both. Every app a test starts uses it through TURBOREMOTE_DIRECTORY_URL.
+/// </summary>
+public sealed class FakeDirectory : IDisposable
+{
+    private readonly TcpListener _listener;
+    private readonly Dictionary<string, List<string>> _topics = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+    private int _posts, _polls;
+
+    public string BaseUrl { get; private set; }
+    public int Posts { get { return Volatile.Read(ref _posts); } }
+    public int Polls { get { return Volatile.Read(ref _polls); } }
+
+    public FakeDirectory()
+    {
+        _listener = new TcpListener(IPAddress.Loopback, 0);
+        _listener.Start();
+        BaseUrl = "http://127.0.0.1:" + ((IPEndPoint)_listener.LocalEndpoint).Port + "/";
+        new Thread(AcceptLoop) { IsBackground = true }.Start();
+    }
+
+    public void ResetCounts()
+    {
+        Interlocked.Exchange(ref _posts, 0);
+        Interlocked.Exchange(ref _polls, 0);
+    }
+
+    private void AcceptLoop()
+    {
+        while (true)
+        {
+            TcpClient c;
+            try { c = _listener.AcceptTcpClient(); } catch { return; }
+            ThreadPool.QueueUserWorkItem(_ => Serve(c));
+        }
+    }
+
+    private void Serve(TcpClient c)
+    {
+        try
+        {
+            using (c)
+            using (NetworkStream s = c.GetStream())
+            {
+                s.ReadTimeout = 5000;
+                string head = ReadHead(s);
+                if (head == null) return;
+                string[] lines = head.Split(new[] { "\r\n" }, StringSplitOptions.None);
+                string[] request = lines[0].Split(' ');
+                if (request.Length < 2) return;
+                int length = 0;
+                bool expectContinue = false;
+                foreach (string line in lines)
+                {
+                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase)) int.TryParse(line.Substring(15).Trim(), out length);
+                    if (line.StartsWith("Expect:", StringComparison.OrdinalIgnoreCase) && line.IndexOf("100-continue", StringComparison.OrdinalIgnoreCase) >= 0) expectContinue = true;
+                }
+                if (expectContinue)
+                {
+                    byte[] cont = Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
+                    s.Write(cont, 0, cont.Length);
+                }
+                byte[] body = new byte[length];
+                for (int read = 0; read < length; )
+                {
+                    int n = s.Read(body, read, length - read);
+                    if (n <= 0) return;
+                    read += n;
+                }
+
+                string topic = request[1].Split('?')[0];
+                if (topic.EndsWith("/raw")) topic = topic.Substring(0, topic.Length - 4);
+                string answer = "";
+                lock (_topics)
+                {
+                    List<string> messages;
+                    if (!_topics.TryGetValue(topic, out messages)) _topics[topic] = messages = new List<string>();
+                    if (request[0] == "POST" || request[0] == "PUT")
+                    {
+                        messages.Add(Encoding.UTF8.GetString(body));
+                        Interlocked.Increment(ref _posts);
+                    }
+                    else
+                    {
+                        answer = string.Join("\n", messages);
+                        Interlocked.Increment(ref _polls);
+                    }
+                }
+                byte[] payload = Encoding.UTF8.GetBytes(answer);
+                byte[] header = Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + payload.Length + "\r\nConnection: close\r\n\r\n");
+                s.Write(header, 0, header.Length);
+                s.Write(payload, 0, payload.Length);
+            }
+        }
+        catch { }
+    }
+
+    private static string ReadHead(NetworkStream s)
+    {
+        List<byte> bytes = new List<byte>();
+        while (bytes.Count < 16384)
+        {
+            int b = s.ReadByte();
+            if (b < 0) return null;
+            bytes.Add((byte)b);
+            int n = bytes.Count;
+            if (n >= 4 && bytes[n - 4] == '\r' && bytes[n - 3] == '\n' && bytes[n - 2] == '\r' && bytes[n - 1] == '\n')
+                return Encoding.ASCII.GetString(bytes.ToArray());
+        }
+        return null;
+    }
+
+    public void Dispose()
+    {
+        try { _listener.Stop(); } catch { }
     }
 }
 
@@ -353,6 +518,56 @@ public static class Uia
     {
         try { return el.Current.Name ?? ""; } catch { return ""; }
     }
+
+    /// <summary>
+    /// Puts the keyboard focus in the edit box named <paramref name="name"/>, as a click would, without sending any
+    /// keystroke. False when there is no such box or Windows keeps the focus elsewhere (another window in front).
+    /// </summary>
+    public static bool FocusEdit(IntPtr hwnd, string name)
+    {
+        foreach (AutomationElement el in All(hwnd))
+        {
+            try
+            {
+                if (el.Current.ControlType != ControlType.Edit || NameOf(el) != name) continue;
+                el.SetFocus();
+                Thread.Sleep(200);
+                return el.Current.HasKeyboardFocus;
+            }
+            catch { return false; }
+        }
+        return false;
+    }
+
+    /// <summary>Name of the control that has the keyboard focus right now, anywhere on the desktop.</summary>
+    public static string FocusedName()
+    {
+        try
+        {
+            AutomationElement f = AutomationElement.FocusedElement;
+            return f == null ? "" : NameOf(f);
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>True when the window's UI thread answers a plain message within <paramref name="timeoutMs"/>.</summary>
+    public static bool Responds(IntPtr hwnd, int timeoutMs)
+    {
+        IntPtr result;
+        return SendMessageTimeout(hwnd, 0x0000 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero, 0x0002 /*SMTO_ABORTIFHUNG*/, (uint)timeoutMs, out result) != IntPtr.Zero;
+    }
+
+    /// <summary>True when Windows itself considers the window "Not Responding" (no messages taken for 5 s).</summary>
+    public static bool IsHung(IntPtr hwnd)
+    {
+        return IsHungAppWindow(hwnd);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsHungAppWindow(IntPtr h);
 
     /// <summary>Names of every visible control in the window, leaving out list items (log lines, file lists).</summary>
     public static List<string> Names(IntPtr hwnd)

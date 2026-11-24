@@ -28,7 +28,7 @@ Once you click **🖥 Share this PC**, sharing starts right away. The **Connect 
    - There is no shared default PIN any more. On first run the Host generates a random access key (e.g., `K9X4-M7P2`) and saves it for your Windows user in `%LOCALAPPDATA%\TurboRemote\access_key.txt`, so it stays the same on every start. Give this key to whoever connects.
    - Click **`🎲 New key`** for a new random key. A key you generate or type in the Host window is saved for the next start (a key passed with `--pin` is used for that run only).
    - **Internet access needs a strong key**: at least 8 characters (dashes and spaces don't count) with at least 4 different characters. With a weaker key, such as the old `2580`, the Host stays LAN-only: it opens no Internet tunnel, publishes nothing under its Host ID, and the log says why. Change the key while sharing and Internet access turns on or off by itself.
-3. **Tailscale** (recommended, see Case B): `Tailscale ON — from anywhere, connect to: WM-DEV-07`, or a **Get Tailscale** button when it is not installed.
+3. **Tailscale** (recommended, see Case B): `Tailscale ON — from anywhere, connect to: WM-DEV-07`, or a **Get Tailscale** button when it is not installed. **`↻ Check again`** re-reads Tailscale right away (it is also re-read every 30 s), e.g. just after you sign in to it. If MagicDNS is switched off in your Tailscale account, names do not work, so the line and **`📋 Copy name`** give the Tailscale address (`100.x.y.z`) instead.
 4. **Also allow viewers without Tailscale (public tunnel)**: the built-in fallback tunnel (`tcp://xxxx.run.pinggy-free.link:PORT`). It opens by itself when Tailscale is **not** running on this PC; tick the box to open it anyway. The free tunnel's address changes every 60 minutes; the Host reconnects and re-publishes it on its own.
 
 Also in the Host window:
@@ -147,3 +147,8 @@ You can also launch `TurboRemote.exe` directly via command line or batch scripts
 # Run the built-in automated diagnostic self-test (Screen Capture + AES-256 E2EE + Internet hardening checks):
 .\TurboRemote.exe --self-test
 ```
+
+Advanced: three environment variables move what TurboRemote uses (the tests use them to run in a sandbox):
+- `TURBOREMOTE_DATA_DIR` — the folder for `settings.txt`, `access_key.txt` and the tunnel key (default `%LOCALAPPDATA%\TurboRemote`).
+- `TURBOREMOTE_OPENSSH_DIR` — a folder with `ssh.exe` and `ssh-keygen.exe` to use instead of Windows' OpenSSH Client.
+- `TURBOREMOTE_DIRECTORY_URL` — the cloud directory instead of `https://ntfy.sh/`.

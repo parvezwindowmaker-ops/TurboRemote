@@ -449,6 +449,47 @@ namespace TurboCore
     /// The Host's access key. The old fixed default PIN 2580 faced the whole Internet once the tunnel worked,
     /// so each Windows user now gets a random key on first run, kept for later runs.
     /// </summary>
+    /// <summary>
+    /// Where TurboRemote keeps its files, and the outside tools and services it uses. Each can be moved with an
+    /// environment variable, for portable installs and for the tests (which must never touch the user's own files,
+    /// ntfy.sh or pinggy).
+    /// </summary>
+    public static class TurboPaths
+    {
+        /// <summary>%LOCALAPPDATA%\TurboRemote, or TURBOREMOTE_DATA_DIR: settings, saved access key, tunnel key.</summary>
+        public static string DataDir
+        {
+            get
+            {
+                string custom = Environment.GetEnvironmentVariable("TURBOREMOTE_DATA_DIR");
+                if (!string.IsNullOrWhiteSpace(custom)) return custom.Trim();
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
+            }
+        }
+
+        /// <summary>TURBOREMOTE_OPENSSH_DIR: a folder with ssh.exe and ssh-keygen.exe to use instead of Windows' own; null if unset.</summary>
+        public static string OpenSshDir
+        {
+            get
+            {
+                string custom = Environment.GetEnvironmentVariable("TURBOREMOTE_OPENSSH_DIR");
+                return string.IsNullOrWhiteSpace(custom) ? null : custom.Trim();
+            }
+        }
+
+        /// <summary>The cloud directory (ntfy.sh), or TURBOREMOTE_DIRECTORY_URL; always ends with "/".</summary>
+        public static string CloudDirectoryUrl
+        {
+            get
+            {
+                string custom = Environment.GetEnvironmentVariable("TURBOREMOTE_DIRECTORY_URL");
+                if (string.IsNullOrWhiteSpace(custom)) return "https://ntfy.sh/";
+                custom = custom.Trim();
+                return custom.EndsWith("/") ? custom : custom + "/";
+            }
+        }
+    }
+
     public static class AccessKeyStore
     {
         public const string LegacyDefaultPin = "2580";
@@ -456,11 +497,7 @@ namespace TurboCore
 
         public static string KeyFilePath
         {
-            get
-            {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
-                return Path.Combine(dir, "access_key.txt");
-            }
+            get { return Path.Combine(TurboPaths.DataDir, "access_key.txt"); }
         }
 
         /// <summary>
@@ -1431,15 +1468,40 @@ namespace TurboCore
         /// </summary>
         public static void DeriveCloudDirectory(string roomCode, string pin, out string topicUrl, out string ticketSecret)
         {
-            byte[] salt = Encoding.UTF8.GetBytes("TURBOREMOTE_CLOUD_DIRECTORY_V2::" + roomCode.Trim().ToUpperInvariant());
-            using (Rfc2898DeriveBytes kdf = new Rfc2898DeriveBytes(pin.Trim(), salt, CloudKdfIterations, HashAlgorithmName.SHA256))
+            string id = roomCode.Trim().ToUpperInvariant();
+            string cacheKey = id + "\n" + pin.Trim();
+            byte[] block;
+            lock (_derivedDirectories)
             {
-                byte[] block = kdf.GetBytes(32);
-                // The topic is public to ntfy.sh; the other half never leaves this PC.
-                topicUrl = "https://ntfy.sh/trbo2_" + ToHex(block, 0, 16);
-                ticketSecret = ToHex(block, 16, 16);
+                _derivedDirectories.TryGetValue(cacheKey, out block);
             }
+            if (block == null)
+            {
+                // A third of a second each time: a reconnect loop needs the same answer every few seconds.
+                byte[] salt = Encoding.UTF8.GetBytes("TURBOREMOTE_CLOUD_DIRECTORY_V2::" + id);
+                using (Rfc2898DeriveBytes kdf = new Rfc2898DeriveBytes(pin.Trim(), salt, CloudKdfIterations, HashAlgorithmName.SHA256))
+                {
+                    block = kdf.GetBytes(32);
+                }
+                lock (_derivedDirectories)
+                {
+                    if (_derivedDirectories.Count >= 64) _derivedDirectories.Clear();
+                    _derivedDirectories[cacheKey] = block;
+                }
+            }
+            // The topic is public to ntfy.sh; the other half never leaves this PC.
+            topicUrl = TurboPaths.CloudDirectoryUrl + "trbo2_" + ToHex(block, 0, 16);
+            ticketSecret = ToHex(block, 16, 16);
         }
+
+        private static readonly Dictionary<string, byte[]> _derivedDirectories = new Dictionary<string, byte[]>();
+
+        // What each topic's last lookup found (or null), and when. Reconnect attempts reuse it for 30 s: ntfy.sh
+        // limits each public IP per day, and an office's Hosts and viewers may share one.
+        private sealed class RecentLookup { public string Ticket; public long AtMs; }
+        private static readonly Dictionary<string, RecentLookup> _recentLookups = new Dictionary<string, RecentLookup>();
+        private static readonly Stopwatch _lookupClock = Stopwatch.StartNew();
+        private const int LookupReuseMs = 30000;
 
         private static string ToHex(byte[] bytes, int offset, int count)
         {
@@ -1518,47 +1580,72 @@ namespace TurboCore
             }
         }
 
-        public static Task<string> ResolveHostTicketFromCloudAsync(string roomCode, string pin)
+        /// <summary>
+        /// The Host's latest ticket from the cloud directory, or null. With <paramref name="reuseRecent"/> (reconnect
+        /// attempts) a lookup of the same Host from the last 30 s is reused instead of polling again.
+        /// </summary>
+        public static Task<string> ResolveHostTicketFromCloudAsync(string roomCode, string pin, bool reuseRecent = false)
         {
             return Task.Run(() =>
             {
-                try
+                // A Host never publishes under a weak key, so there is nothing to find.
+                if (AccessKeyStore.WhyTooWeakForInternet(pin) != null) return (string)null;
+
+                string topicUrl, ticketSecret;
+                DeriveCloudDirectory(roomCode, pin, out topicUrl, out ticketSecret);
+                if (reuseRecent)
                 {
-                    // A Host never publishes under a weak key, so there is nothing to find.
-                    if (AccessKeyStore.WhyTooWeakForInternet(pin) != null) return (string)null;
-
-                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                    string topicUrl, ticketSecret;
-                    DeriveCloudDirectory(roomCode, pin, out topicUrl, out ticketSecret);
-                    string url = topicUrl + "/raw?poll=1&since=12h";
-
-                    HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-                    req.Method = "GET";
-                    // DNS + TCP + TLS + the poll took ~0.7 s even on a fast link; 2 s was too tight for slow ones.
-                    req.Timeout = CloudLookupTimeoutMs;
-                    req.ReadWriteTimeout = CloudLookupTimeoutMs;
-                    using (WebResponse resp = req.GetResponse())
-                    using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                    lock (_recentLookups)
                     {
-                        string all = sr.ReadToEnd();
-                        string[] lines = all.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                        for (int i = lines.Length - 1; i >= 0; i--)
-                        {
-                            try
-                            {
-                                string decrypted = DecryptTicketFromCloud(lines[i], ticketSecret);
-                                if (!string.IsNullOrWhiteSpace(decrypted))
-                                {
-                                    return decrypted;
-                                }
-                            }
-                            catch { }
-                        }
+                        RecentLookup recent;
+                        if (_recentLookups.TryGetValue(topicUrl, out recent) && _lookupClock.ElapsedMilliseconds - recent.AtMs < LookupReuseMs)
+                            return recent.Ticket;
                     }
                 }
-                catch { }
-                return (string)null;
+
+                string ticket = PollTicket(topicUrl, ticketSecret);
+                lock (_recentLookups)
+                {
+                    if (_recentLookups.Count >= 64) _recentLookups.Clear();
+                    _recentLookups[topicUrl] = new RecentLookup { Ticket = ticket, AtMs = _lookupClock.ElapsedMilliseconds };
+                }
+                return ticket;
             });
+        }
+
+        private static string PollTicket(string topicUrl, string ticketSecret)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                string url = topicUrl + "/raw?poll=1&since=12h";
+
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                // DNS + TCP + TLS + the poll took ~0.7 s even on a fast link; 2 s was too tight for slow ones.
+                req.Timeout = CloudLookupTimeoutMs;
+                req.ReadWriteTimeout = CloudLookupTimeoutMs;
+                using (WebResponse resp = req.GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                {
+                    string all = sr.ReadToEnd();
+                    string[] lines = all.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    for (int i = lines.Length - 1; i >= 0; i--)
+                    {
+                        try
+                        {
+                            string decrypted = DecryptTicketFromCloud(lines[i], ticketSecret);
+                            if (!string.IsNullOrWhiteSpace(decrypted))
+                            {
+                                return decrypted;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         public static List<string> GetRawHostIps()
@@ -1780,23 +1867,14 @@ namespace TurboCore
         /// direct connection: it used to win the race (its edge answers fast) and the session then died with
         /// the tunnel's hourly cut.
         /// </summary>
-        public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin, CancellationToken ct)
+        public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin, CancellationToken ct, bool reuseRecentLookup = false)
         {
             string rawInput = hostInput != null ? hostInput.Trim() : "";
             bool isAuto = string.IsNullOrEmpty(rawInput) || rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase);
             ConnectionRace race = new ConnectionRace(DialTcpAsync);
 
-            // 1. Whatever the user typed is dialled at once, even a tunnel address they chose on purpose.
-            List<string> hostIds = new List<string>();
-            if (!isAuto)
-            {
-                foreach (string token in rawInput.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    string clean = token.Trim().TrimStart('@');
-                    if (LooksLikeHostId(clean) && !hostIds.Contains(clean, StringComparer.OrdinalIgnoreCase)) hostIds.Add(clean);
-                    foreach (EndpointCandidate c in ParseCandidates(clean, defaultPort)) race.AddDirect(c);
-                }
-            }
+            // 1. Whatever the user typed.
+            List<string> hostIds = isAuto ? new List<string>() : AddTypedCandidates(race, rawInput, defaultPort);
 
             // 2. LAN broadcast discovery. With Host IDs typed, only a LAN Host of that name is taken: any other
             //    TurboRemote PC on the LAN could otherwise answer first.
@@ -1815,7 +1893,7 @@ namespace TurboCore
             List<Task> lookups = new List<Task> { lanTask };
             foreach (string id in hostIds)
             {
-                lookups.Add(ResolveHostTicketFromCloudAsync(id, pin).ContinueWith(t =>
+                lookups.Add(ResolveHostTicketFromCloudAsync(id, pin, reuseRecentLookup).ContinueWith(t =>
                 {
                     if (t.Status != TaskStatus.RanToCompletion || string.IsNullOrWhiteSpace(t.Result)) return;
                     foreach (EndpointCandidate cc in ParseCandidates(t.Result, defaultPort))
@@ -1845,6 +1923,29 @@ namespace TurboCore
                 throw new TimeoutException("Timed out connecting to " + rawInput + ":" + defaultPort + ". Make sure TurboRemote Host is running.");
             }
             return new KeyValuePair<TcpClient, EndpointCandidate>(winner.Key, LabelByConnectedAddress(winner.Key, winner.Value));
+        }
+
+        /// <summary>
+        /// Adds what the user typed (Host ID, IP, address, or a list) to <paramref name="race"/> and returns the
+        /// Host IDs among it, for the cloud directory lookup. A tunnel address typed alone was chosen on purpose and
+        /// is dialled at once; in a list (a pasted ticket, or a reconnect's "typed,machineName") it is held back like
+        /// any tunnel route, or it could beat Tailscale and put the session on the route that dies every hour.
+        /// </summary>
+        public static List<string> AddTypedCandidates(ConnectionRace race, string rawInput, int defaultPort)
+        {
+            List<string> hostIds = new List<string>();
+            string[] tokens = (rawInput ?? "").Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string token in tokens)
+            {
+                string clean = token.Trim().TrimStart('@');
+                if (LooksLikeHostId(clean) && !hostIds.Contains(clean, StringComparer.OrdinalIgnoreCase)) hostIds.Add(clean);
+                foreach (EndpointCandidate c in ParseCandidates(clean, defaultPort))
+                {
+                    if (tokens.Length > 1 && IsPublicTunnelHost(c.Host)) race.AddTunnel(c);
+                    else race.AddDirect(c);
+                }
+            }
+            return hostIds;
         }
 
         /// <summary>
@@ -1974,7 +2075,12 @@ namespace TurboCore
                 if (timedOut) _result.TrySetException(new TimeoutException("No route to the Host answered within " + (_overallMs / 1000) + " s."));
             }, TaskScheduler.Default);
 
-            using (ct.Register(() => _result.TrySetCanceled()))
+            // Marked done inside the cancel itself: a route answering at that moment is then closed, not handed out.
+            using (ct.Register(() =>
+            {
+                lock (_lock) { _done = true; }
+                _result.TrySetCanceled();
+            }))
             {
                 try
                 {
@@ -1984,6 +2090,9 @@ namespace TurboCore
                 {
                     lock (_lock) { _done = true; }
                     _raceCts.Cancel(); // stops the timers and every attempt still running
+                    // Unhooks the race from the caller's token: a reconnect loop runs one race per attempt on the
+                    // same token, for as long as an outage lasts.
+                    _raceCts.Dispose();
                 }
             }
         }
@@ -2024,7 +2133,7 @@ namespace TurboCore
                     }
                     else if (client == null)
                     {
-                        bool windowExpired = dialCts.IsCancellationRequested && !_raceCts.IsCancellationRequested;
+                        bool windowExpired = dialCts.IsCancellationRequested && !_done;
                         _lastError = windowExpired
                             ? new TimeoutException(c.Host + ":" + c.Port + " did not answer within " + (_windowMs / 1000) + " s.")
                             : error;
@@ -2032,8 +2141,9 @@ namespace TurboCore
                     }
                 }
 
-                if (won) _result.TrySetResult(new KeyValuePair<TcpClient, EndpointCandidate>(client, c));
-                else if (client != null) { try { client.Close(); } catch { } }
+                // TrySetResult fails when the race was cancelled meanwhile; nobody else would close this connection.
+                if (won && !_result.TrySetResult(new KeyValuePair<TcpClient, EndpointCandidate>(client, c))) won = false;
+                if (!won && client != null) { try { client.Close(); } catch { } }
                 if (fail != null) _result.TrySetException(fail);
                 dialCts.Dispose();
             });
@@ -2132,9 +2242,11 @@ namespace TurboCore
     /// </summary>
     public static class PublicTunnel
     {
-        /// <summary>Prefers the Windows OpenSSH client; falls back to whatever is on PATH.</summary>
+        /// <summary>Prefers the Windows OpenSSH client; falls back to whatever is on PATH. TURBOREMOTE_OPENSSH_DIR wins.</summary>
         public static string FindOpenSshTool(string exeName)
         {
+            string custom = TurboPaths.OpenSshDir;
+            if (custom != null) return Path.Combine(custom, exeName);
             try
             {
                 string inbox = Path.Combine(Path.Combine(Environment.SystemDirectory, "OpenSSH"), exeName);
@@ -2152,7 +2264,7 @@ namespace TurboCore
         public static string EnsureTunnelKey(out string error)
         {
             error = null;
-            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote");
+            string dir = TurboPaths.DataDir;
             string keyPath = Path.Combine(dir, "tunnel_ed25519");
             try
             {
@@ -2313,7 +2425,7 @@ namespace TurboCore
         }
     }
 
-    /// <summary>Per-user settings in %LOCALAPPDATA%\TurboRemote\settings.txt, one "key=value" per line.</summary>
+    /// <summary>Per-user settings in settings.txt in <see cref="TurboPaths.DataDir"/>, one "key=value" per line.</summary>
     public static class TurboSettings
     {
         private static readonly object _lock = new object();
@@ -2326,7 +2438,7 @@ namespace TurboCore
             get
             {
                 if (!string.IsNullOrEmpty(FilePathOverride)) return FilePathOverride;
-                return Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TurboRemote"), "settings.txt");
+                return Path.Combine(TurboPaths.DataDir, "settings.txt");
             }
         }
 
@@ -2430,8 +2542,13 @@ namespace TurboCore
         public string DnsName = "";
         public string HostName = "";
         public string IPv4 = "";
+        /// <summary>Whether the tailnet resolves names (MagicDNS). Without it, only the address works.</summary>
+        public bool MagicDnsEnabled = true;
 
         public bool IsRunning { get { return State == TailscaleState.Running; } }
+
+        /// <summary>What another PC in the tailnet should type to reach this one.</summary>
+        public string ConnectName { get { return !MagicDnsEnabled || string.IsNullOrEmpty(DnsName) ? IPv4 : DnsName; } }
     }
 
     /// <summary>
@@ -2452,6 +2569,17 @@ namespace TurboCore
             if (string.IsNullOrEmpty(ip) || !IPAddress.TryParse(ip, out addr) || addr.AddressFamily != AddressFamily.InterNetwork) return false;
             byte[] b = addr.GetAddressBytes();
             return b[0] == 100 && (b[1] & 0xC0) == 0x40;
+        }
+
+        /// <summary>The Host window's Tailscale line while Tailscale runs.</summary>
+        public static string HostLine(TailscaleStatus st, string machineName)
+        {
+            // Without MagicDNS neither the Host ID nor the .ts.net name resolves from outside the office.
+            if (!st.MagicDnsEnabled && !string.IsNullOrEmpty(st.IPv4))
+                return "Tailscale ON — from anywhere, connect to: " + st.IPv4 + "  (MagicDNS is off in Tailscale, so names do not work)";
+            string where = string.IsNullOrEmpty(st.DnsName) ? st.IPv4 : st.DnsName + " · " + st.IPv4;
+            string name = string.IsNullOrEmpty(st.HostName) ? machineName : st.HostName;
+            return "Tailscale ON — from anywhere, connect to: " + name + "  (" + where + ")";
         }
 
         /// <summary>Reads the output of "tailscale status --json". Only this PC's own entry ("Self") is used.</summary>
@@ -2477,6 +2605,14 @@ namespace TurboCore
                     st.DnsName = (ReadString(statusJson, "DNSName", selfStart, selfEnd) ?? "").TrimEnd('.');
                     st.HostName = ReadString(statusJson, "HostName", selfStart, selfEnd) ?? "";
                     st.IPv4 = FirstIPv4(statusJson, "TailscaleIPs", selfStart, selfEnd) ?? "";
+                }
+
+                // Older Tailscale versions do not say; they had MagicDNS on unless someone turned it off.
+                int netStart, netEnd;
+                if (FindObject(statusJson, "CurrentTailnet", out netStart, out netEnd))
+                {
+                    int v = ValueStart(statusJson, "MagicDNSEnabled", netStart, netEnd);
+                    if (v >= 0 && string.CompareOrdinal(statusJson, v, "false", 0, 5) == 0) st.MagicDnsEnabled = false;
                 }
             }
             catch
