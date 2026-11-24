@@ -736,6 +736,20 @@ namespace TurboHost
         private System.Windows.Forms.Timer _keyApplyTimer;
         private int _listenPort;
 
+        // Tailscale gives this PC a permanent address, so the hourly public tunnel is only a fallback
+        // (see TunnelAutoSwitch). UI thread only, except the volatile/Interlocked fields.
+        private TunnelAutoSwitch _tunnelSwitch = new TunnelAutoSwitch(TurboSettings.Get("publicTunnel", "auto"));
+        private readonly Stopwatch _hostClock = new Stopwatch();
+        private volatile bool _tunnelWanted;
+        private volatile bool _tunnelStopPending;
+        private int _tunnelSessions; // signed-in or signing-in sessions that came in through the tunnel (loopback)
+        private TailscaleStatus _tailscale = new TailscaleStatus();
+        private bool _tailscaleRefreshing, _updatingTunnelBox;
+        private Label _lblTailscale;
+        private Button _btnTailscale;
+        private CheckBox _chkPublicTunnel;
+        private System.Windows.Forms.Timer _tailscaleTimer;
+
         public HostMainForm()
         {
             Text = "TurboRemote — Host Server  v" + TurboProtocol.AppVersion;
@@ -756,6 +770,11 @@ namespace TurboHost
             InitializeUi();
             PopulateNetworkEndpoints();
             UpdateAdminBadge();
+
+            _tailscaleTimer = new System.Windows.Forms.Timer { Interval = 30000 };
+            _tailscaleTimer.Tick += async (s, e) => await RefreshTailscaleAsync();
+            _tailscaleTimer.Start();
+            Shown += async (s, e) => await RefreshTailscaleAsync();
         }
 
         private void InitializeUi()
@@ -939,7 +958,7 @@ namespace TurboHost
             grpReverse.Controls.AddRange(new Control[] { lblRevInfo, lblRHost, _txtRelayHost, lblRPort, _txtRelayPort, _btnConnectRelay });
             Controls.Add(grpReverse);
 
-            GroupBox grpEndpoints = CreateGroupBox("3. Cloud Room ID, Connection Endpoints & Auto Public Internet Tunnel", 16, 252, 727, 130);
+            GroupBox grpEndpoints = CreateGroupBox("3. Host ID, Tailscale (Permanent Address) & Connection Endpoints", 16, 252, 727, 182);
 
             Label lblRoom = new Label { Text = "Host ID:", Location = new Point(542, 26), AutoSize = true, ForeColor = Color.FromArgb(255, 225, 130) };
             _txtRoomId = new TextBox
@@ -974,13 +993,34 @@ namespace TurboHost
                 await PublishTicketToCloudDirectoryAsync(true);
             };
 
-            Button btnStartPublicTunnel = CreateButton("🌍 Auto Internet Tunnel", 542, 88, 170, 28, Color.FromArgb(30, 130, 115));
-            btnStartPublicTunnel.Click += (s, e) => StartBuiltInPublicSshTunnel();
+            _lblTailscale = new Label
+            {
+                Text = "Tailscale: checking…",
+                Location = new Point(14, 122),
+                Size = new Size(520, 22),
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = Color.FromArgb(170, 185, 210)
+            };
 
-            grpEndpoints.Controls.AddRange(new Control[] { _lstEndpoints, lblRoom, _txtRoomId, btnCopyIp, btnStartPublicTunnel });
+            _btnTailscale = CreateButton("📋 Copy Tailscale name", 542, 120, 170, 26, Color.FromArgb(45, 95, 110));
+            _btnTailscale.Visible = false;
+            _btnTailscale.Click += (s, e) => OnTailscaleButtonClicked();
+
+            // Replaces the old "Auto Internet Tunnel" button: the hourly tunnel is now a fallback.
+            _chkPublicTunnel = new CheckBox
+            {
+                Location = new Point(14, 150),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(190, 205, 230),
+                Font = new Font("Segoe UI", 8.6f)
+            };
+            _chkPublicTunnel.CheckedChanged += (s, e) => OnPublicTunnelBoxChanged();
+            UpdateTunnelBox();
+
+            grpEndpoints.Controls.AddRange(new Control[] { _lstEndpoints, lblRoom, _txtRoomId, btnCopyIp, _lblTailscale, _btnTailscale, _chkPublicTunnel });
             Controls.Add(grpEndpoints);
 
-            GroupBox grpLog = CreateGroupBox("4. Real-Time Session Telemetry & Security Log", 16, 390, 727, 200);
+            GroupBox grpLog = CreateGroupBox("4. Real-Time Session Telemetry & Security Log", 16, 442, 727, 148);
             _lblStatus = new Label
             {
                 Text = "● Server Status: STOPPED",
@@ -1002,7 +1042,7 @@ namespace TurboHost
             _lstLog = new ListBox
             {
                 Location = new Point(14, 46),
-                Size = new Size(698, 140),
+                Size = new Size(698, 92),
                 BackColor = Color.FromArgb(14, 16, 22),
                 ForeColor = Color.FromArgb(200, 215, 230),
                 Font = new Font("Consolas", 8.8f),
@@ -1136,6 +1176,141 @@ namespace TurboHost
             Task publish = PublishTicketToCloudDirectoryAsync();
         }
 
+        /// <summary>UI thread. Re-reads Tailscale (off the UI thread) and applies the public-tunnel decision.</summary>
+        private async Task RefreshTailscaleAsync()
+        {
+            if (_tailscaleRefreshing || IsDisposed) return;
+            _tailscaleRefreshing = true;
+            try
+            {
+                TailscaleStatus st = await Task.Run(() => TailscaleInfo.Query());
+                if (IsDisposed) return;
+                _tailscale = st;
+                ShowTailscaleLine(st);
+                if (_isRunning)
+                {
+                    _tunnelWanted = _tunnelSwitch.Update(st.State, _hostClock.Elapsed);
+                    ApplyTunnelPolicy();
+                }
+                UpdateTunnelBox();
+            }
+            catch { }
+            finally
+            {
+                _tailscaleRefreshing = false;
+            }
+        }
+
+        private void ShowTailscaleLine(TailscaleStatus st)
+        {
+            switch (st.State)
+            {
+                case TailscaleState.Running:
+                    string where = string.IsNullOrEmpty(st.DnsName) ? st.IPv4 : st.DnsName + " · " + st.IPv4;
+                    string name = string.IsNullOrEmpty(st.HostName) ? Environment.MachineName : st.HostName;
+                    _lblTailscale.Text = "Tailscale ON — from anywhere, connect to: " + name + "  (" + where + ")";
+                    _lblTailscale.ForeColor = Color.FromArgb(120, 235, 170);
+                    _btnTailscale.Text = "📋 Copy Tailscale name";
+                    _btnTailscale.Visible = true;
+                    break;
+                case TailscaleState.Starting:
+                    _lblTailscale.Text = "Tailscale is starting…";
+                    _lblTailscale.ForeColor = Color.FromArgb(170, 185, 210);
+                    _btnTailscale.Visible = false;
+                    break;
+                case TailscaleState.NotInstalled:
+                    _lblTailscale.Text = "For a permanent Internet address, install Tailscale on this PC and the viewer PC (same account).";
+                    _lblTailscale.ForeColor = Color.FromArgb(255, 210, 120);
+                    _btnTailscale.Text = "⬇ Get Tailscale";
+                    _btnTailscale.Visible = true;
+                    break;
+                default:
+                    _lblTailscale.Text = "Tailscale is installed but not connected — open Tailscale and sign in.";
+                    _lblTailscale.ForeColor = Color.FromArgb(255, 210, 120);
+                    _btnTailscale.Visible = false;
+                    break;
+            }
+        }
+
+        private void OnTailscaleButtonClicked()
+        {
+            if (_tailscale.IsRunning)
+            {
+                string name = string.IsNullOrEmpty(_tailscale.DnsName) ? _tailscale.IPv4 : _tailscale.DnsName;
+                try { Clipboard.SetText(name); } catch { }
+                Log("[Tailscale] Copied " + name + ". On any PC in your Tailscale account, type it (or just the Host ID) in the viewer.");
+                return;
+            }
+            try { Process.Start("https://tailscale.com/download"); } catch { }
+        }
+
+        /// <summary>The tunnel switch wants the tunnel and the key is strong enough to face the Internet. Any thread.</summary>
+        private bool WantTunnel()
+        {
+            if (!_tunnelWanted) return false;
+            string key;
+            try { key = GetPinThreadSafe(); } catch { return false; } // form closing
+            return !IsInternetRefusedForKey(key);
+        }
+
+        /// <summary>UI thread. Opens or closes the public tunnel to match <see cref="WantTunnel"/>.</summary>
+        private void ApplyTunnelPolicy()
+        {
+            if (!_isRunning) return;
+            if (WantTunnel())
+            {
+                _tunnelStopPending = false;
+                StartBuiltInPublicSshTunnel();
+                return;
+            }
+
+            Process tunnel = _tunnelProc;
+            bool open = false;
+            try { open = tunnel != null && !tunnel.HasExited; } catch { }
+            if (!open) return;
+
+            // Never cut a viewer who is connected through the tunnel; close it once they leave.
+            if (Volatile.Read(ref _tunnelSessions) > 0)
+            {
+                if (!_tunnelStopPending) Log("[Auto-Tunnel] The public tunnel will close when the viewer connected through it disconnects.");
+                _tunnelStopPending = true;
+                return;
+            }
+
+            _tunnelStopPending = false;
+            try { tunnel.Kill(); } catch { }
+            Log(_tunnelSwitch.IsAutomatic
+                ? "[Auto-Tunnel] Public tunnel closed: Tailscale gives this PC a permanent address."
+                : "[Auto-Tunnel] Public tunnel closed.");
+        }
+
+        private void UpdateTunnelBox()
+        {
+            _updatingTunnelBox = true;
+            try
+            {
+                _chkPublicTunnel.Text = "Also open a public tunnel for viewers without Tailscale (address changes every hour)" +
+                                        (_tunnelSwitch.IsAutomatic ? " (automatic)" : "");
+                _chkPublicTunnel.Checked = _isRunning ? _tunnelWanted : TurboSettings.Get("publicTunnel", "auto") == "on";
+            }
+            finally
+            {
+                _updatingTunnelBox = false;
+            }
+        }
+
+        private void OnPublicTunnelBoxChanged()
+        {
+            if (_updatingTunnelBox) return;
+            string setting = _chkPublicTunnel.Checked ? "on" : "off";
+            TurboSettings.Set("publicTunnel", setting);
+            _tunnelSwitch = new TunnelAutoSwitch(setting);
+            _tunnelWanted = _tunnelSwitch.Update(_tailscale.State, _hostClock.Elapsed);
+            Log("[Auto-Tunnel] Public tunnel set to " + setting + " (saved for the next start).");
+            ApplyTunnelPolicy();
+            UpdateTunnelBox();
+        }
+
         private void StartBuiltInPublicSshTunnel()
         {
             try
@@ -1145,8 +1320,9 @@ namespace TurboHost
                     return;
                 }
 
-                // Opening the tunnel exposes the key check to the whole Internet.
-                if (IsInternetRefusedForKey(GetPinThreadSafe()))
+                // Opening the tunnel exposes the key check to the whole Internet, and with Tailscale running it
+                // only adds a route that dies every hour.
+                if (!WantTunnel())
                 {
                     return;
                 }
@@ -1222,10 +1398,8 @@ namespace TurboHost
             CancellationTokenSource cts = _serverCts;
             if (_isRunning && cts != null && !cts.IsCancellationRequested)
             {
-                string key;
-                try { key = GetPinThreadSafe(); } catch { return; } // form closing
-                // Closed on purpose for a weak key: it reopens once the key is strong again.
-                if (AccessKeyStore.WhyTooWeakForInternet(key) != null) return;
+                // Closed on purpose (weak key, Tailscale running, box unticked): nothing to restart.
+                if (!WantTunnel()) return;
 
                 Log("[Auto-Tunnel] Tunnel closed; reconnecting in 5 seconds...");
                 CancellationToken token = cts.Token;
@@ -1366,9 +1540,9 @@ namespace TurboHost
             }
             catch { }
 
-            // 3. Automatically start & maintain Public Internet Tunnel (with auto-reconnect watchdog).
-            //    Refused while the access key is too weak to face the Internet.
-            StartBuiltInPublicSshTunnel();
+            // 3. Decide about the public tunnel from Tailscale's state (re-checked every 30 s by the timer). The
+            //    tunnel only opens when that decision wants it and the access key is strong enough.
+            try { BeginInvoke(new Func<Task>(RefreshTailscaleAsync)); } catch (InvalidOperationException) { }
 
             // 4. Every 4 minutes, re-publish the Cloud Rendezvous ticket if it changed (new LAN IP, PIN or Host ID)
             //    or the keep-alive is due, so Internet clients can always find this Host.
@@ -1412,6 +1586,12 @@ namespace TurboHost
 
                 // Start zero-config UDP LAN Auto-Discovery Beacon on port 9878
                 SmartRouteEngine.StartLanBeaconResponder(() => port, cts.Token);
+
+                // A fresh decision per start: the 60 s wait for a Tailscale that is still starting counts from here.
+                _tunnelSwitch = new TunnelAutoSwitch(TurboSettings.Get("publicTunnel", "auto"));
+                _tunnelWanted = false;
+                _tunnelStopPending = false;
+                _hostClock.Restart();
 
                 _isRunning = true;
                 _btnStartStop.Text = "⏹ Stop Host Server";
@@ -1521,6 +1701,7 @@ namespace TurboHost
             }
 
             Interlocked.Increment(ref _connectedClients);
+            if (sharedAddress) Interlocked.Increment(ref _tunnelSessions);
             Log("[Connect] Incoming TLS-Grade E2EE connection from " + remoteEp);
 
             try
@@ -1626,6 +1807,11 @@ namespace TurboHost
             finally
             {
                 Interlocked.Decrement(ref _connectedClients);
+                // The last viewer on the tunnel left: a close that was waiting for them can happen now.
+                if (sharedAddress && Interlocked.Decrement(ref _tunnelSessions) == 0 && _tunnelStopPending && !IsDisposed)
+                {
+                    try { BeginInvoke(new Action(ApplyTunnelPolicy)); } catch (InvalidOperationException) { }
+                }
                 UpdateStatsLabel(0);
                 try { client.Close(); } catch { }
             }
@@ -1665,6 +1851,7 @@ namespace TurboHost
             // Stop first so the tunnel watchdog does not schedule a restart when the tunnel is killed below.
             _isRunning = false;
             try { _keyApplyTimer.Dispose(); } catch { }
+            try { _tailscaleTimer.Dispose(); } catch { }
             try { if (_serverCts != null) _serverCts.Cancel(); } catch { }
             try { if (_listener != null) _listener.Stop(); } catch { }
             // The ssh.exe tunnel used to outlive TurboRemote as an orphan process, keeping the public relay open.
