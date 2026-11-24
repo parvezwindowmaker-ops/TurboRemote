@@ -2210,6 +2210,38 @@ namespace TurboCore
         }
     }
 
+    /// <summary>The Host refused the sign-in (wrong key, locked out). Retrying would only trip the lockout.</summary>
+    public sealed class AuthRefusedException : Exception
+    {
+        public AuthRefusedException(string message) : base(message) { }
+    }
+
+    public enum SessionEndReason { UserDisconnect, Cancelled, HostClosed, NetworkError, DeadLink, AuthRefused }
+
+    /// <summary>When and whether the viewer redials a session that ended without the user asking.</summary>
+    public static class ReconnectSchedule
+    {
+        /// <summary>Viewer side: a session with no packet at all for this long is dead (the Host pongs every second).</summary>
+        public const int DeadLinkMs = 20000;
+
+        /// <summary>Wait before attempt <paramref name="attempt"/> (1-based): 1, 2, 3, 5, then 5 s forever.</summary>
+        public static int DelayBeforeAttemptMs(int attempt)
+        {
+            switch (attempt)
+            {
+                case 1: return 1000;
+                case 2: return 2000;
+                case 3: return 3000;
+                default: return 5000;
+            }
+        }
+
+        public static bool ShouldReconnect(SessionEndReason reason)
+        {
+            return reason == SessionEndReason.HostClosed || reason == SessionEndReason.NetworkError || reason == SessionEndReason.DeadLink;
+        }
+    }
+
     /// <summary>Per-user settings in %LOCALAPPDATA%\TurboRemote\settings.txt, one "key=value" per line.</summary>
     public static class TurboSettings
     {

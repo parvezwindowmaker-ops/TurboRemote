@@ -274,6 +274,27 @@ namespace TurboClient
         private Button _btnLockInput;
         private Label _lblNotice;
 
+        // Auto-reconnect. What to redial after a session ends without the user asking (never for Listen Mode),
+        // and the state shown while it retries.
+        private sealed class ReconnectTarget
+        {
+            public string HostInput;
+            public int Port;
+            public string Pin;
+            public string MachineName;
+        }
+        private ReconnectTarget _reconnectTarget;
+        private CancellationTokenSource _reconnectCts;
+        private bool _isReconnecting;
+        private int _reconnectAttempt, _reconnectNextInSec;
+        private string _reconnectName = "";
+        private readonly Stopwatch _lostClock = new Stopwatch();
+        private readonly Stopwatch _uiClock = Stopwatch.StartNew();
+        private long _reconnectedNoticeUntilMs = -1;
+        private string _reconnectedNoticeText = "";
+        private long _lastPacketTicks;
+        private string _connectedMachine;
+
         private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
 
         [DllImport("user32.dll")]
@@ -655,6 +676,11 @@ namespace TurboClient
 
         private async Task ToggleConnectAsync()
         {
+            if (_isReconnecting)
+            {
+                StopReconnecting("● RECONNECT STOPPED.");
+                return;
+            }
             if (_isConnected || _isConnecting)
             {
                 Disconnect();
@@ -702,6 +728,7 @@ namespace TurboClient
                 EndpointCandidate route = winner.Value;
 
                 await InitializeActiveSessionAsync(client, route, myConnectToken);
+                _reconnectTarget = new ReconnectTarget { HostInput = hostInput, Port = port, Pin = _txtPin.Text.Trim(), MachineName = _connectedMachine };
             }
             catch (OperationCanceledException)
             {
@@ -766,7 +793,8 @@ namespace TurboClient
                 _btnListenReverse.Text = "📡 Listen Mode (9877)";
 
                 // Replacing a live session in place left its receive loop reading the new stream.
-                if (_isConnected || _isConnecting) Disconnect();
+                if (_isConnected || _isConnecting || _isReconnecting) Disconnect();
+                _reconnectTarget = null; // the Host dials in here; there is nothing for this viewer to redial
 
                 await InitializeActiveSessionAsync(client, new EndpointCandidate
                 {
@@ -781,7 +809,12 @@ namespace TurboClient
             }
         }
 
-        private async Task InitializeActiveSessionAsync(TcpClient client, EndpointCandidate winningRoute, CancellationToken connectCt)
+        /// <summary>
+        /// Signs in on <paramref name="client"/> and starts the session. With <paramref name="expectedMachine"/> set
+        /// (reconnects), a different PC answering is refused. Throws <see cref="AuthRefusedException"/> when the Host
+        /// refuses the key; a "busy" refusal is an ordinary failure, worth retrying.
+        /// </summary>
+        private async Task InitializeActiveSessionAsync(TcpClient client, EndpointCandidate winningRoute, CancellationToken connectCt, string expectedMachine = null, string pinOverride = null)
         {
             _tcpClient = client;
             _tcpClient.NoDelay = true;
@@ -795,7 +828,7 @@ namespace TurboClient
             KeyValuePair<PacketType, byte[]>? challengePkt = await TurboProtocol.ReadPacketAsync(_stream, _sessionCts.Token);
             if (challengePkt == null || challengePkt.Value.Key != PacketType.AuthChallenge || challengePkt.Value.Value.Length != 32)
             {
-                Disconnect();
+                CloseSessionSocket();
                 throw new Exception("Host did not send valid 32-byte cryptographic challenge.");
             }
 
@@ -805,7 +838,7 @@ namespace TurboClient
             Buffer.BlockCopy(challengePkt.Value.Value, 16, challenge16, 0, 16);
 
             // 2. Derive Session AES-256 + HMAC-SHA256 Keys via PBKDF2-SHA256 & Send Zero-Knowledge Proof
-            string pin = _txtPin.Text.Trim();
+            string pin = pinOverride ?? _txtPin.Text.Trim();
             _sec = new SecurityContext(pin, salt16, challenge16);
             byte[] proof = _sec.ComputeHandshakeProof(challenge16, "CLIENT_AUTH_V2");
             await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.AuthResponse, proof, _sessionCts.Token);
@@ -814,7 +847,7 @@ namespace TurboClient
             KeyValuePair<PacketType, byte[]>? authResp = await TurboProtocol.ReadPacketAsync(_stream, _sessionCts.Token);
             if (authResp == null || authResp.Value.Key != PacketType.AuthResult)
             {
-                Disconnect();
+                CloseSessionSocket();
                 throw new Exception("Host closed connection during cryptographic handshake.");
             }
 
@@ -823,14 +856,17 @@ namespace TurboClient
             string checkClear = Encoding.UTF8.GetString(rawPayload);
             if (checkClear.StartsWith("FAIL:"))
             {
-                Disconnect();
-                throw new Exception("Authentication rejected (" + checkClear + ")");
+                CloseSessionSocket();
+                string why = "Authentication rejected (" + checkClear + ")";
+                // "Busy" means try later; anything else is the key itself, and retrying it trips the lockout.
+                if (checkClear.IndexOf("busy", StringComparison.OrdinalIgnoreCase) >= 0) throw new Exception(why);
+                throw new AuthRefusedException(why);
             }
 
             string authText = Encoding.UTF8.GetString(_sec.VerifyAndDecrypt(PacketType.AuthResult, rawPayload));
             if (!authText.StartsWith("OK|"))
             {
-                Disconnect();
+                CloseSessionSocket();
                 throw new Exception("Authentication verification failed.");
             }
 
@@ -840,6 +876,14 @@ namespace TurboClient
             // Hosts from v2026.11.23 on add their version as field 6; older ones send nothing there.
             string hostVersion = parts.Length > 5 && parts[5].StartsWith("v") ? parts[5].Substring(1) : null;
 
+            if (expectedMachine != null && !string.Equals(remoteMachine, expectedMachine, StringComparison.OrdinalIgnoreCase))
+            {
+                CloseSessionSocket();
+                throw new Exception("A different PC (" + remoteMachine + ") answered instead of " + expectedMachine + ".");
+            }
+
+            _connectedMachine = remoteMachine;
+            Interlocked.Exchange(ref _lastPacketTicks, Stopwatch.GetTimestamp());
             _isConnected = true;
             _btnConnect.Text = "⏹ Disconnect";
             _btnConnect.BackColor = Color.FromArgb(185, 55, 55);
@@ -869,7 +913,34 @@ namespace TurboClient
             Task.Run(() => ReceivePacketsLoopAsync(activeStream, activeSec, activeToken));
         }
 
+        /// <summary>The user's Disconnect (or the start of a new connect): also stops reconnecting.</summary>
         private void Disconnect()
+        {
+            if (_isReconnecting) StopReconnecting(null);
+            _reconnectTarget = null;
+            EndSession();
+        }
+
+        /// <summary>Closes the socket and keys without touching the UI (failed sign-ins, failed reconnect attempts).</summary>
+        private void CloseSessionSocket()
+        {
+            try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
+            NetworkStream oldStream = _stream;
+            TcpClient oldClient = _tcpClient;
+            SecurityContext oldSec = _sec;
+            _stream = null;
+            _tcpClient = null;
+            _sec = null;
+            try { if (oldStream != null) oldStream.Dispose(); } catch { }
+            try { if (oldClient != null) oldClient.Close(); } catch { }
+            try { if (oldSec != null) oldSec.Dispose(); } catch { }
+        }
+
+        /// <summary>
+        /// Ends the current session (keyboard capture off, hook removed, held input forgotten) but keeps the last
+        /// remote picture, which stays on screen while reconnecting.
+        /// </summary>
+        private void EndSession()
         {
             _isConnected = false;
             _isConnecting = false;
@@ -908,12 +979,18 @@ namespace TurboClient
 
         private async Task ReceivePacketsLoopAsync(NetworkStream sessionStream, SecurityContext sessionSec, CancellationToken ct)
         {
+            SessionEndReason endReason = SessionEndReason.NetworkError;
             try
             {
                 while (!ct.IsCancellationRequested && _isConnected)
                 {
                     KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(sessionStream, ct, sessionSec);
-                    if (pkt == null) break;
+                    if (pkt == null)
+                    {
+                        endReason = SessionEndReason.HostClosed;
+                        break;
+                    }
+                    Interlocked.Exchange(ref _lastPacketTicks, Stopwatch.GetTimestamp());
 
                     PacketType type = pkt.Value.Key;
                     byte[] payload = pkt.Value.Value;
@@ -970,12 +1047,112 @@ namespace TurboClient
             finally
             {
                 // Only when the HOST ended the CURRENT session. After a user Disconnect (token cancelled, _stream
-                // cleared or replaced) a late Disconnect here could tear down a connection the user just started.
+                // cleared or replaced) a late teardown here could end a connection the user just started.
                 if (!ct.IsCancellationRequested && !IsDisposed && _stream == sessionStream)
                 {
-                    try { BeginInvoke(new Action(Disconnect)); } catch (InvalidOperationException) { }
+                    SessionEndReason reason = endReason;
+                    try { BeginInvoke(new Action(() => OnSessionLost(sessionStream, reason))); } catch (InvalidOperationException) { }
                 }
             }
+        }
+
+        /// <summary>UI thread. The current session ended without the user asking: reconnect if that makes sense.</summary>
+        private void OnSessionLost(NetworkStream sessionStream, SessionEndReason reason)
+        {
+            if (!_isConnected || (sessionStream != null && !ReferenceEquals(_stream, sessionStream))) return;
+            ReconnectTarget target = _reconnectTarget;
+            EndSession();
+            if (target != null && ReconnectSchedule.ShouldReconnect(reason))
+            {
+                Task loop = ReconnectLoopAsync(target);
+                return;
+            }
+            _lblTelemetry.Text = reason == SessionEndReason.HostClosed
+                ? "● DISCONNECTED: the Host ended the session."
+                : "● DISCONNECTED: the connection was lost.";
+        }
+
+        /// <summary>
+        /// UI thread. Redials until the session is back, the user stops it, or the Host refuses the key. Dials what
+        /// the user typed plus the Host's own name, so a dead typed address (e.g. an expired tunnel) is no dead end.
+        /// </summary>
+        private async Task ReconnectLoopAsync(ReconnectTarget target)
+        {
+            CancellationTokenSource cts = new CancellationTokenSource();
+            _reconnectCts = cts;
+            CancellationToken ct = cts.Token;
+            _isReconnecting = true;
+            _lostClock.Restart();
+            _reconnectName = string.IsNullOrEmpty(target.MachineName) ? target.HostInput : target.MachineName;
+            _btnConnect.Text = "✖ Stop reconnecting";
+            _btnConnect.BackColor = Color.FromArgb(195, 110, 30);
+
+            string dial = target.HostInput;
+            if (!string.IsNullOrEmpty(target.MachineName) && !string.Equals(target.HostInput, target.MachineName, StringComparison.OrdinalIgnoreCase))
+            {
+                dial += "," + target.MachineName;
+            }
+
+            for (int attempt = 1; !ct.IsCancellationRequested; attempt++)
+            {
+                _reconnectAttempt = attempt;
+                try
+                {
+                    for (int left = ReconnectSchedule.DelayBeforeAttemptMs(attempt); left > 0; left -= 250)
+                    {
+                        _reconnectNextInSec = (left + 999) / 1000;
+                        ShowReconnectStatus();
+                        await Task.Delay(Math.Min(250, left), ct);
+                    }
+                    _reconnectNextInSec = 0;
+                    ShowReconnectStatus();
+
+                    KeyValuePair<TcpClient, EndpointCandidate> winner = await SmartRouteEngine.RaceFastestConnectionAsync(dial, target.Port, target.Pin, ct);
+                    await InitializeActiveSessionAsync(winner.Key, winner.Value, ct, target.MachineName, target.Pin);
+
+                    if (ReferenceEquals(_reconnectCts, cts)) _reconnectCts = null;
+                    _isReconnecting = false;
+                    _reconnectedNoticeText = "● RECONNECTED after " + ((_lostClock.ElapsedMilliseconds + 500) / 1000) + " s";
+                    _reconnectedNoticeUntilMs = _uiClock.ElapsedMilliseconds + 5000;
+                    _lblTelemetry.Text = _reconnectedNoticeText;
+                    _lblTelemetry.ForeColor = Color.FromArgb(110, 255, 165);
+                    _screenCanvas.Invalidate();
+                    return;
+                }
+                catch (AuthRefusedException ex)
+                {
+                    StopReconnecting("● RECONNECT STOPPED: " + ex.Message);
+                    return;
+                }
+                catch (Exception)
+                {
+                    if (!_isConnected) CloseSessionSocket(); // a half-finished attempt
+                    if (ct.IsCancellationRequested) return;
+                }
+            }
+        }
+
+        private void ShowReconnectStatus()
+        {
+            if (!_isReconnecting) return;
+            _lblTelemetry.Text = "● RECONNECTING to " + _reconnectName + " (attempt " + _reconnectAttempt + ")…";
+            _lblTelemetry.ForeColor = Color.FromArgb(255, 200, 110);
+            _screenCanvas.Invalidate();
+        }
+
+        private void StopReconnecting(string message)
+        {
+            CancellationTokenSource cts = _reconnectCts;
+            _reconnectCts = null;
+            try { if (cts != null) cts.Cancel(); } catch { }
+            _isReconnecting = false;
+            ResetConnectButton();
+            if (message != null)
+            {
+                _lblTelemetry.Text = message;
+                _lblTelemetry.ForeColor = Color.FromArgb(255, 150, 110);
+            }
+            _screenCanvas.Invalidate();
         }
 
         private void ProcessIncomingScreenFrame(byte[] payload)
@@ -995,14 +1172,36 @@ namespace TurboClient
             e.Graphics.InterpolationMode = InterpolationMode.Bilinear;
             e.Graphics.CompositingQuality = CompositingQuality.HighSpeed;
 
+            Rectangle area = new Rectangle(0, 0, _screenCanvas.Width, _screenCanvas.Height);
+            bool drewFrame = false;
             lock (_bitmapLock)
             {
                 if (_remoteBitmap != null)
                 {
-                    e.Graphics.DrawImage(_remoteBitmap, new Rectangle(0, 0, _screenCanvas.Width, _screenCanvas.Height));
-                    return;
+                    e.Graphics.DrawImage(_remoteBitmap, area);
+                    drewFrame = true;
                 }
             }
+
+            if (_isReconnecting)
+            {
+                // The last picture stays, dimmed, under the reconnect banner.
+                if (drewFrame)
+                {
+                    using (SolidBrush dim = new SolidBrush(Color.FromArgb(150, 0, 0, 0))) e.Graphics.FillRectangle(dim, area);
+                }
+                string banner = _reconnectNextInSec > 0
+                    ? string.Format("Connection lost — reconnecting to {0} (attempt {1}, next try in {2} s)…", _reconnectName, _reconnectAttempt, _reconnectNextInSec)
+                    : string.Format("Connection lost — reconnecting to {0} (attempt {1}, trying now)…", _reconnectName, _reconnectAttempt);
+                using (SolidBrush text = new SolidBrush(Color.FromArgb(255, 215, 140)))
+                using (Font font = new Font("Segoe UI", 13f, FontStyle.Bold))
+                {
+                    SizeF sz = e.Graphics.MeasureString(banner, font);
+                    e.Graphics.DrawString(banner, font, text, Math.Max(20, (area.Width - sz.Width) / 2), Math.Max(20, (area.Height - sz.Height) / 2));
+                }
+                return;
+            }
+            if (drewFrame) return;
 
             using (SolidBrush brush = new SolidBrush(Color.FromArgb(140, 160, 190)))
             using (Font font = new Font("Segoe UI", 12f, FontStyle.Bold))
@@ -1210,6 +1409,7 @@ namespace TurboClient
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            if (_isReconnecting) StopReconnecting(null);
             if (_keyboardHook != null)
             {
                 _keyboardHook.Dispose();
@@ -1424,10 +1624,27 @@ namespace TurboClient
 
             if (_isConnected)
             {
-                _lblTelemetry.Text = string.Format("● LIVE | FPS: {0} | Stream In: {1:F1} KB/s | Ping: {2} ms", _currentFps, _currentKbps, _lastPingRttMs);
-                _lblTelemetry.ForeColor = _currentKbps < 80
-                    ? Color.FromArgb(110, 255, 165)
-                    : Color.FromArgb(110, 215, 255);
+                // The Host answers the ping below every second and streams frames; 20 s of nothing at all means
+                // the link is dead (Wi-Fi gone, network changed, Host asleep) even though the socket looks open.
+                long silentMs = (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastPacketTicks)) * 1000 / Stopwatch.Frequency;
+                if (silentMs >= ReconnectSchedule.DeadLinkMs)
+                {
+                    OnSessionLost(_stream, SessionEndReason.DeadLink);
+                    return;
+                }
+
+                if (_uiClock.ElapsedMilliseconds < _reconnectedNoticeUntilMs)
+                {
+                    _lblTelemetry.Text = _reconnectedNoticeText;
+                    _lblTelemetry.ForeColor = Color.FromArgb(110, 255, 165);
+                }
+                else
+                {
+                    _lblTelemetry.Text = string.Format("● LIVE | FPS: {0} | Stream In: {1:F1} KB/s | Ping: {2} ms", _currentFps, _currentKbps, _lastPingRttMs);
+                    _lblTelemetry.ForeColor = _currentKbps < 80
+                        ? Color.FromArgb(110, 255, 165)
+                        : Color.FromArgb(110, 215, 255);
+                }
 
                 byte[] pingPayload = BitConverter.GetBytes(Stopwatch.GetTimestamp());
                 await SendPacketSafeAsync(PacketType.Ping, pingPayload);
