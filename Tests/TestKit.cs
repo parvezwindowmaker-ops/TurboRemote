@@ -92,7 +92,17 @@ public sealed class FakeHost : IDisposable
     private TcpListener _listener;
     private volatile bool _listening;
     private TcpClient _current;
-    private int _accepted, _attempts;
+    private NetworkStream _currentStream;
+    private SecurityContext _currentSec;
+    private SemaphoreSlim _currentWriteLock;
+    private readonly List<TcpClient> _all = new List<TcpClient>();
+    private int _accepted, _attempts, _connections, _open;
+
+    /// <summary>New connections are accepted but get nothing, not even the sign-in challenge.</summary>
+    public volatile bool SilentAfterAccept;
+    public int ConnectionsAccepted { get { return Volatile.Read(ref _connections); } }
+    /// <summary>Connections accepted and not yet closed by either side.</summary>
+    public int OpenConnections { get { return Volatile.Read(ref _open); } }
 
     /// <summary>Sent instead of the default "OK|machine|USER|1|AES-256-HMAC-SHA256|vVERSION".</summary>
     public string AuthResultOverride;
@@ -156,11 +166,55 @@ public sealed class FakeHost : IDisposable
         }
     }
 
+    /// <summary>
+    /// Sends one Pong of <paramref name="payloadBytes"/> spread evenly over <paramref name="durationMs"/>, like a
+    /// big screen frame on a 2G link: bytes keep arriving, but no packet completes until the end.
+    /// </summary>
+    public void SendSlowPacket(int payloadBytes, int durationMs)
+    {
+        NetworkStream s;
+        SecurityContext sec;
+        SemaphoreSlim wl;
+        lock (_lock) { s = _currentStream; sec = _currentSec; wl = _currentWriteLock; }
+        if (s == null) throw new InvalidOperationException("no session");
+        byte[] payload = new byte[payloadBytes];
+        BitConverter.GetBytes(Stopwatch.GetTimestamp()).CopyTo(payload, 0);
+        wl.Wait();
+        try
+        {
+            MemoryStream frame = new MemoryStream();
+            TurboProtocol.SendPacketAsync(frame, new SemaphoreSlim(1, 1), PacketType.Pong, payload, CancellationToken.None, sec).Wait();
+            byte[] bytes = frame.ToArray();
+            const int pieces = 100;
+            int per = bytes.Length / pieces + 1;
+            for (int off = 0; off < bytes.Length; off += per)
+            {
+                s.Write(bytes, off, Math.Min(per, bytes.Length - off));
+                s.Flush();
+                Thread.Sleep(durationMs / pieces);
+            }
+        }
+        finally
+        {
+            wl.Release();
+        }
+    }
+
     private async Task ServeAsync(TcpClient c)
     {
+        Interlocked.Increment(ref _connections);
+        Interlocked.Increment(ref _open);
+        lock (_lock) { _all.Add(c); }
         try
         {
             NetworkStream s = c.GetStream();
+            if (SilentAfterAccept)
+            {
+                // Hold the connection without a word until the other side gives up and closes it.
+                byte[] one = new byte[1];
+                while (await s.ReadAsync(one, 0, 1) > 0) { }
+                return;
+            }
             SemaphoreSlim wl = new SemaphoreSlim(1, 1);
             byte[] salt = new byte[16], chal = new byte[16];
             using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) { rng.GetBytes(salt); rng.GetBytes(chal); }
@@ -189,7 +243,7 @@ public sealed class FakeHost : IDisposable
 
             string ok = AuthResultOverride ?? string.Format("OK|{0}|USER|1|AES-256-HMAC-SHA256|v{1}", _machineName, TurboProtocol.AppVersion);
             await TurboProtocol.SendPacketAsync(s, wl, PacketType.AuthResult, Encoding.UTF8.GetBytes(ok), CancellationToken.None, sec);
-            lock (_lock) { _current = c; }
+            lock (_lock) { _current = c; _currentStream = s; _currentSec = sec; _currentWriteLock = wl; }
             Interlocked.Increment(ref _accepted);
 
             while (true)
@@ -205,6 +259,7 @@ public sealed class FakeHost : IDisposable
         catch { }
         finally
         {
+            Interlocked.Decrement(ref _open);
             try { c.Close(); } catch { }
         }
     }
@@ -213,6 +268,11 @@ public sealed class FakeHost : IDisposable
     {
         StopListening();
         CloseSession();
+        lock (_lock)
+        {
+            foreach (TcpClient c in _all) { try { c.Close(); } catch { } }
+            _all.Clear();
+        }
     }
 }
 
@@ -292,6 +352,29 @@ public static class Uia
     private static string NameOf(AutomationElement el)
     {
         try { return el.Current.Name ?? ""; } catch { return ""; }
+    }
+
+    /// <summary>Names of every visible control in the window, leaving out list items (log lines, file lists).</summary>
+    public static List<string> Names(IntPtr hwnd)
+    {
+        List<string> names = new List<string>();
+        foreach (AutomationElement el in All(hwnd))
+        {
+            try { if (el.Current.ControlType == ControlType.ListItem) continue; } catch { continue; }
+            string n = NameOf(el);
+            if (n.Length > 0) names.Add(n);
+        }
+        return names;
+    }
+
+    /// <summary>True when some visible control's name contains <paramref name="text"/> (ignoring case).</summary>
+    public static bool HasName(IntPtr hwnd, string text)
+    {
+        foreach (string n in Names(hwnd))
+        {
+            if (n.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        }
+        return false;
     }
 
     public static string FindText(IntPtr hwnd, string startsWith)

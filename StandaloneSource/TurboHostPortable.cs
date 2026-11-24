@@ -70,6 +70,21 @@ namespace TurboHost
         // dead (network gone, viewer frozen); before, it stayed open until TCP gave up, which could take forever.
         public const int ViewerSilenceTimeoutMs = 45000;
         private long _lastReceivedTicks = Stopwatch.GetTimestamp();
+        private CancellationTokenSource _sessionCts;
+
+        /// <summary>How long this viewer has sent nothing at all.</summary>
+        public long SilentMs
+        {
+            get { return (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastReceivedTicks)) * 1000 / Stopwatch.Frequency; }
+        }
+
+        /// <summary>Ends the session; its normal teardown then releases any keys and buttons the viewer held.</summary>
+        public void Abort()
+        {
+            CancellationTokenSource cts = _sessionCts;
+            try { if (cts != null) cts.Cancel(); } catch (ObjectDisposedException) { }
+            try { _client.Close(); } catch { }
+        }
 
         private async Task SilenceWatchdogAsync(CancellationToken ct)
         {
@@ -89,6 +104,7 @@ namespace TurboHost
         {
             using (CancellationTokenSource sessionCts = CancellationTokenSource.CreateLinkedTokenSource(parentCt))
             {
+                _sessionCts = sessionCts;
                 CancellationToken ct = sessionCts.Token;
                 Task screenTask = Task.Run(() => ScreenStreamingLoopAsync(ct), ct);
                 Task receiveTask = Task.Run(() => CommandReceiveLoopAsync(ct), ct);
@@ -1703,6 +1719,32 @@ namespace TurboHost
             }
         }
 
+        // Signed-in sessions, so a new sign-in can close the dead ones (see CloseSilentSessions).
+        private readonly List<ClientSessionHandler> _sessions = new List<ClientSessionHandler>();
+        private const int DeadSiblingSilenceMs = 5000;
+
+        /// <summary>
+        /// Every viewer pings once a second, so a session silent for over 5 s when another viewer signs in is that
+        /// viewer's dead previous session (a reconnect after a dropped link). It used to linger until its 45 s
+        /// watchdog, keeping any key or button it held pressed into the new session.
+        /// </summary>
+        private void CloseSilentSessions()
+        {
+            List<ClientSessionHandler> silent = new List<ClientSessionHandler>();
+            lock (_sessions)
+            {
+                foreach (ClientSessionHandler s in _sessions)
+                {
+                    if (s.SilentMs > DeadSiblingSilenceMs) silent.Add(s);
+                }
+            }
+            foreach (ClientSessionHandler s in silent)
+            {
+                Log("[Session] A viewer signed in; closing a session that has been silent for " + (s.SilentMs / 1000) + " s (its keys and buttons are released).");
+                s.Abort();
+            }
+        }
+
         private async Task HandleClientSessionAsync(TcpClient client, CancellationToken ct)
         {
             string remoteEp = client.Client.RemoteEndPoint != null ? client.Client.RemoteEndPoint.ToString() : "Unknown";
@@ -1818,7 +1860,16 @@ namespace TurboHost
                         Log("[Security VERIFIED] " + remoteEp + " authenticated via Zero-Knowledge PBKDF2-SHA256 & AES-256 E2EE.");
 
                         ClientSessionHandler session = new ClientSessionHandler(client, stream, writeLock, sec, Log, AddBytesSent, BuildElevatedRestartArgs);
-                        await session.RunAsync(ct);
+                        CloseSilentSessions();
+                        lock (_sessions) { _sessions.Add(session); }
+                        try
+                        {
+                            await session.RunAsync(ct);
+                        }
+                        finally
+                        {
+                            lock (_sessions) { _sessions.Remove(session); }
+                        }
                     }
                 }
             }

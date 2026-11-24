@@ -12,14 +12,25 @@ class ReconnectTests
     static bool Reconnecting { get { return Uia.FindText(Wnd, "✖ Stop reconnecting") != null; } }
     static string Telemetry { get { return Uia.FindText(Wnd, "●") ?? ""; } }
 
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+
     static string Diag()
     {
         _viewer.Refresh();
         IntPtr w = Wnd;
         int count = -1;
+        string uiaError = "";
         try { count = System.Windows.Automation.AutomationElement.FromHandle(w).FindAll(System.Windows.Automation.TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition).Count; }
-        catch (Exception ex) { Console.WriteLine("      uia error: " + ex.GetType().Name + ": " + ex.Message); }
-        return string.Format(" [wnd=0x{0:X} exited={1} title='{2}' uiaElements={3}]", w.ToInt64(), _viewer.HasExited, Uia.WindowTitle(_viewer), count);
+        catch (Exception ex) { uiaError = " uiaError=" + ex.GetType().Name + ": " + ex.Message; }
+        // Does the viewer's UI thread answer a plain message? (WM_NULL, up to 5 s)
+        Stopwatch sw = Stopwatch.StartNew();
+        IntPtr result;
+        IntPtr ok = SendMessageTimeout(w, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002 /*SMTO_ABORTIFHUNG*/, 5000, out result);
+        return string.Format(" [wnd=0x{0:X} exited={1} hung={2} wmNull={3} in {4} ms foreground={5} title='{6}' uiaElements={7}{8}]",
+            w.ToInt64(), _viewer.HasExited, IsHungAppWindow(w), ok != IntPtr.Zero ? "answered" : "NO ANSWER", sw.ElapsedMilliseconds,
+            GetForegroundWindow() == w, Uia.WindowTitle(_viewer), count, uiaError);
     }
 
     static int Main(string[] args)
@@ -77,7 +88,7 @@ class ReconnectTests
             Thread.Sleep(20000);
             TestKit.Check("a wrong key is tried once and never retried", host.SignInAttempts - before == 1 && !Reconnecting,
                 (host.SignInAttempts - before) + " attempt(s), reconnecting: " + Reconnecting);
-            TestKit.Check("...and the viewer shows why", Telemetry.Contains("Invalid Access Key"), Telemetry);
+            TestKit.Check("...and the viewer shows why", Telemetry.Contains("Invalid Access Key"), Telemetry + Diag());
 
             // Busy: keep trying.
             host.FailText = null;
@@ -87,7 +98,7 @@ class ReconnectTests
             before = host.SignInAttempts;
             host.CloseSession();
             Thread.Sleep(20000);
-            TestKit.Check("'Host is busy' is retried", host.SignInAttempts - before >= 3 && Reconnecting, (host.SignInAttempts - before) + " attempts");
+            TestKit.Check("'Host is busy' is retried", host.SignInAttempts - before >= 3 && Reconnecting, (host.SignInAttempts - before) + " attempts" + Diag());
             host.FailText = null;
             TestKit.Check("...and the session comes back once the Host accepts", TestKit.WaitUntil(() => host.SessionsAccepted == 6, 10000), null);
 
@@ -101,7 +112,7 @@ class ReconnectTests
             before = host.SignInAttempts;
             Thread.Sleep(15000);
             TestKit.Check("Stop ends the retries", host.SignInAttempts == before && Uia.FindText(Wnd, "⚡ Connect to Host") != null,
-                (host.SignInAttempts - before) + " attempts after Stop");
+                (host.SignInAttempts - before) + " attempts after Stop" + Diag());
             host.FailText = null;
 
             // A different PC answers on the same address: not accepted.
@@ -142,6 +153,57 @@ class ReconnectTests
         {
             TestKit.Kill(_viewer);
             oldAddress.Dispose();
+        }
+
+        // An address that accepts the connection but never says a word must not hang the reconnect forever,
+        // and Stop must end an attempt that is waiting on such an address.
+        int p4 = TestKit.FreePort();
+        FakeHost mute = new FakeHost(p4, "2580", "FAKE-PC");
+        _viewer = TestKit.StartApp("--client --connect 127.0.0.1 --port " + p4 + " --pin 2580");
+        try
+        {
+            TestKit.WaitUntil(() => mute.SessionsAccepted == 1, 20000);
+            int before = mute.ConnectionsAccepted;
+            mute.SilentAfterAccept = true;
+            mute.CloseSession();
+            bool retried = TestKit.WaitUntil(() => mute.ConnectionsAccepted >= before + 2, 30000);
+            TestKit.Check("a silent address times out and the next attempt starts", retried, (mute.ConnectionsAccepted - before) + " connection(s) in 30 s");
+            TestKit.WaitUntil(() => mute.OpenConnections > 0, 10000);
+            Uia.Invoke(Wnd, "Stop reconnecting");
+            bool released = TestKit.WaitUntil(() => mute.OpenConnections == 0, 3000);
+            TestKit.Check("Stop closes the attempt that was waiting", released, mute.OpenConnections + " connection(s) still open");
+        }
+        finally
+        {
+            TestKit.Kill(_viewer);
+            mute.Dispose();
+        }
+
+        // The typed address now belongs to another TurboRemote PC that refuses this key, while the right PC is
+        // reachable by its name: reconnect must not stop at "key rejected", and must not keep knocking there.
+        int p5 = TestKit.FreePort(), p6 = TestKit.FreePort();
+        FakeHost original = new FakeHost(p5, "2580", "localhost");
+        _viewer = TestKit.StartApp("--client --connect 127.0.0.1:" + p5 + " --port " + p6 + " --pin 2580");
+        FakeHost stranger = null, home = null;
+        try
+        {
+            TestKit.WaitUntil(() => original.SessionsAccepted == 1, 20000);
+            original.StopListening();
+            original.CloseSession();
+            stranger = new FakeHost(p5, "someone-elses-key-9", "OTHER-PC");
+            home = new FakeHost(p6, "2580", "localhost");
+            FakeHost h = home;
+            bool found = TestKit.WaitUntil(() => h.SessionsAccepted == 1, 25000);
+            TestKit.Check("a stale address that refuses the key does not stop the reconnect; the PC's name finds it",
+                found, "sign-ins at the stranger: " + stranger.SignInAttempts + ", sessions at home: " + home.SessionsAccepted + ", status: " + Telemetry);
+            TestKit.Check("...and the stranger was asked at most twice (far below its lockout)", stranger.SignInAttempts <= 2, stranger.SignInAttempts + " sign-in(s)");
+        }
+        finally
+        {
+            TestKit.Kill(_viewer);
+            original.Dispose();
+            if (stranger != null) stranger.Dispose();
+            if (home != null) home.Dispose();
         }
 
         return TestKit.Summary();

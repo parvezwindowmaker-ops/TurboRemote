@@ -31,7 +31,9 @@ class HostTimeoutTests
             Stopwatch sinceLastPing = Stopwatch.StartNew();
             a.GoSilent();
 
-            Thread.Sleep(5000);
+            // B signs in while A has been silent only 2 s: A is not yet known to be dead, so it must stay until
+            // its 45 s watchdog (checked below).
+            Thread.Sleep(2000);
             Stopwatch bTime = Stopwatch.StartNew();
             FakeViewer b = null;
             try { b = FakeViewer.Connect("127.0.0.1", port, "2580"); } catch (Exception ex) { Console.WriteLine("      B: " + ex.Message); }
@@ -45,14 +47,35 @@ class HostTimeoutTests
             string logLine = Uia.ListItems(Uia.Window(host)).FirstOrDefault(l => l.Contains("No data from the viewer for 45 s"));
             TestKit.Check("the Host log says why it closed the session", logLine != null, logLine);
 
-            TestKit.WaitUntil(() => false, Math.Max(0, 70000 - (int)closedAfter - 11000));
+            // A viewer that reconnects after a dead link: its old session on the Host is silent (but not yet 45 s).
+            // It must be closed the moment the new session signs in, so the keys and buttons it still held are
+            // released at once instead of staying pressed for up to ~25 s into the new session. C keeps pinging.
+            FakeViewer e = FakeViewer.Connect("127.0.0.1", port, "2580");
+            for (int i = 0; i < 3; i++) { e.Ping(); Thread.Sleep(1000); }
+            e.GoSilent();
+            Thread.Sleep(7000);
+            FakeViewer f = FakeViewer.Connect("127.0.0.1", port, "2580");
+            bool eClosed = e.WaitForClose(3000);
+            TestKit.Check("a new sign-in closes a session that has been silent for over 5 s", eClosed, null);
+            string siblingLine = Uia.ListItems(Uia.Window(host)).FirstOrDefault(l => l.Contains("silent for"));
+            TestKit.Check("...and the Host log says so", siblingLine != null, siblingLine);
+            f.Dispose();
+            e.Dispose();
+
             stopC.Cancel();
             cPings.Wait(3000);
-            TestKit.Check("a viewer that keeps pinging stays connected (70 s)", !c.WaitForClose(0), null);
+            TestKit.Check("a viewer that keeps pinging stays connected (over 60 s, through two other sign-ins)", !c.WaitForClose(0), null);
 
             TailscaleStatus ts = TailscaleInfo.Query();
             if (ts.IsRunning)
             {
+                var byName = SmartRouteEngine.RaceFastestConnectionAsync(ts.DnsName, port, "2580", CancellationToken.None).Result;
+                TestKit.Check("connecting by Tailscale name is labelled as the permanent Tailscale route", byName.Value.RouteLabel == "Tailscale (permanent)", byName.Value.RouteLabel);
+                byName.Key.Close();
+                var byHostId = SmartRouteEngine.RaceFastestConnectionAsync(Environment.MachineName, port, "2580", CancellationToken.None).Result;
+                TestKit.Check("connecting by Host ID is not labelled as the public tunnel", byHostId.Value.RouteLabel != "Public Internet / WAN Tunnel", byHostId.Value.RouteLabel);
+                byHostId.Key.Close();
+
                 bool viaIp = false, viaName = false;
                 try { using (FakeViewer t = FakeViewer.Connect(ts.IPv4, port, "2580")) viaIp = t.AuthText.StartsWith("OK|"); } catch (Exception ex) { Console.WriteLine("      via IP: " + ex.Message); }
                 try { using (FakeViewer t = FakeViewer.Connect(ts.DnsName, port, "2580")) viaName = t.AuthText.StartsWith("OK|"); } catch (Exception ex) { Console.WriteLine("      via name: " + ex.Message); }

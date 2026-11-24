@@ -1792,13 +1792,35 @@ namespace TurboCore
                 race.NoMoreCandidates();
             }, TaskScheduler.Default);
 
+            KeyValuePair<TcpClient, EndpointCandidate> winner;
             try
             {
-                return await race.RunAsync(ct);
+                winner = await race.RunAsync(ct);
             }
             catch (TimeoutException)
             {
                 throw new TimeoutException("Timed out connecting to " + rawInput + ":" + defaultPort + ". Make sure TurboRemote Host is running.");
+            }
+            return new KeyValuePair<TcpClient, EndpointCandidate>(winner.Key, LabelByConnectedAddress(winner.Key, winner.Value));
+        }
+
+        /// <summary>
+        /// A name (Host ID, MagicDNS name) says nothing about the route, so label it by the address it actually
+        /// reached: the title used to say "Public Internet / WAN Tunnel" for every Tailscale connection by name.
+        /// </summary>
+        private static EndpointCandidate LabelByConnectedAddress(TcpClient tcp, EndpointCandidate c)
+        {
+            IPAddress literal;
+            if (c == null || IPAddress.TryParse(c.Host, out literal) || IsPublicTunnelHost(c.Host)) return c;
+            try
+            {
+                IPEndPoint remote = tcp.Client.RemoteEndPoint as IPEndPoint;
+                if (remote == null) return c;
+                return new EndpointCandidate { Host = c.Host, Port = c.Port, RouteLabel = ClassifyRoute(remote.Address.ToString()) };
+            }
+            catch
+            {
+                return c;
             }
         }
     }
@@ -2209,6 +2231,52 @@ namespace TurboCore
             if (colon <= 0 || !int.TryParse(endpoint.Substring(colon + 1), out port) || port < 1 || port > 65535) return null;
             return endpoint;
         }
+    }
+
+    /// <summary>
+    /// Read-only pass-through that reports every chunk of bytes as it arrives. On a 2G link one large screen
+    /// frame can take longer than the dead-link limit to arrive whole; bytes still arriving mean the link lives.
+    /// </summary>
+    public sealed class ActivityStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly Action _onData;
+
+        public ActivityStream(Stream inner, Action onData)
+        {
+            _inner = inner;
+            _onData = onData;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int n = _inner.Read(buffer, offset, count);
+            if (n > 0) _onData();
+            return n;
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int n = await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+            if (n > 0) _onData();
+            return n;
+        }
+
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new NotSupportedException(); } }
+        public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+    }
+
+    /// <summary>A different PC answered at the address a reconnect dialled.</summary>
+    public sealed class WrongHostException : Exception
+    {
+        public WrongHostException(string message) : base(message) { }
     }
 
     /// <summary>The Host refused the sign-in (wrong key, locked out). Retrying would only trip the lockout.</summary>

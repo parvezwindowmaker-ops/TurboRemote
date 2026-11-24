@@ -301,6 +301,8 @@ namespace TurboClient
         private bool _ownTailscaleRefreshing;
         private int _ticksSinceTailscaleCheck;
         private const string TailscaleHint = "If this PC is outside the Host's network, install Tailscale on both PCs and sign in to the same account.";
+        private const int ChallengeTimeoutMs = 15000;
+        private const int AuthResultTimeoutMs = 100000;
 
         private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
 
@@ -838,27 +840,51 @@ namespace TurboClient
             _stream = _tcpClient.GetStream();
             _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(connectCt);
 
-            // 1. Read 32B Cryptographic Challenge (16B Salt + 16B Nonce) from Host
-            KeyValuePair<PacketType, byte[]>? challengePkt = await TurboProtocol.ReadPacketAsync(_stream, _sessionCts.Token);
-            if (challengePkt == null || challengePkt.Value.Key != PacketType.AuthChallenge || challengePkt.Value.Value.Length != 32)
-            {
-                CloseSessionSocket();
-                throw new Exception("Host did not send valid 32-byte cryptographic challenge.");
-            }
-
+            KeyValuePair<PacketType, byte[]>? challengePkt, authResp;
             byte[] salt16 = new byte[16];
             byte[] challenge16 = new byte[16];
-            Buffer.BlockCopy(challengePkt.Value.Value, 0, salt16, 0, 16);
-            Buffer.BlockCopy(challengePkt.Value.Value, 16, challenge16, 0, 16);
 
-            // 2. Derive Session AES-256 + HMAC-SHA256 Keys via PBKDF2-SHA256 & Send Zero-Knowledge Proof
-            string pin = pinOverride ?? _txtPin.Text.Trim();
-            _sec = new SecurityContext(pin, salt16, challenge16);
-            byte[] proof = _sec.ComputeHandshakeProof(challenge16, "CLIENT_AUTH_V2");
-            await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.AuthResponse, proof, _sessionCts.Token);
+            // The sign-in has time limits, and Stop or a timeout closes the socket: on .NET Framework a pending
+            // NetworkStream read ignores its token, so an address that accepted the connection but never spoke
+            // used to hang a reconnect (and its Stop button) forever.
+            using (CancellationTokenSource handshake = CancellationTokenSource.CreateLinkedTokenSource(_sessionCts.Token))
+            using (handshake.Token.Register(() => { try { client.Close(); } catch { } }))
+            {
+                try
+                {
+                    // 1. Read 32B Cryptographic Challenge (16B Salt + 16B Nonce) from Host
+                    handshake.CancelAfter(ChallengeTimeoutMs);
+                    challengePkt = await TurboProtocol.ReadPacketAsync(_stream, handshake.Token);
+                    if (challengePkt == null || challengePkt.Value.Key != PacketType.AuthChallenge || challengePkt.Value.Value.Length != 32)
+                    {
+                        CloseSessionSocket();
+                        throw new Exception("Host did not send valid 32-byte cryptographic challenge.");
+                    }
 
-            // 3. Receive & Decrypt AuthResult
-            KeyValuePair<PacketType, byte[]>? authResp = await TurboProtocol.ReadPacketAsync(_stream, _sessionCts.Token);
+                    Buffer.BlockCopy(challengePkt.Value.Value, 0, salt16, 0, 16);
+                    Buffer.BlockCopy(challengePkt.Value.Value, 16, challenge16, 0, 16);
+
+                    // 2. Derive Session AES-256 + HMAC-SHA256 Keys via PBKDF2-SHA256 & Send Zero-Knowledge Proof
+                    string pin = pinOverride ?? _txtPin.Text.Trim();
+                    _sec = new SecurityContext(pin, salt16, challenge16);
+                    byte[] proof = _sec.ComputeHandshakeProof(challenge16, "CLIENT_AUTH_V2");
+                    await TurboProtocol.SendPacketAsync(_stream, _writeLock, PacketType.AuthResponse, proof, handshake.Token);
+
+                    // 3. Receive & Decrypt AuthResult. The Host's Internet sign-in throttle may hold it for ~90 s.
+                    handshake.CancelAfter(AuthResultTimeoutMs);
+                    authResp = await TurboProtocol.ReadPacketAsync(_stream, handshake.Token);
+                }
+                catch (Exception ex)
+                {
+                    bool timedOut = handshake.IsCancellationRequested && !_sessionCts.IsCancellationRequested;
+                    CloseSessionSocket();
+                    if (timedOut) throw new TimeoutException("The Host did not answer the sign-in in time.");
+                    if (connectCt.IsCancellationRequested) throw new OperationCanceledException(connectCt);
+                    throw new Exception("Sign-in was interrupted: " + ex.Message, ex);
+                }
+            }
+            connectCt.ThrowIfCancellationRequested();
+
             if (authResp == null || authResp.Value.Key != PacketType.AuthResult)
             {
                 CloseSessionSocket();
@@ -893,7 +919,7 @@ namespace TurboClient
             if (expectedMachine != null && !string.Equals(remoteMachine, expectedMachine, StringComparison.OrdinalIgnoreCase))
             {
                 CloseSessionSocket();
-                throw new Exception("A different PC (" + remoteMachine + ") answered instead of " + expectedMachine + ".");
+                throw new WrongHostException("A different PC (" + remoteMachine + ") answered instead of " + expectedMachine + ".");
             }
 
             _connectedMachine = remoteMachine;
@@ -1025,11 +1051,13 @@ namespace TurboClient
         private async Task ReceivePacketsLoopAsync(NetworkStream sessionStream, SecurityContext sessionSec, CancellationToken ct)
         {
             SessionEndReason endReason = SessionEndReason.NetworkError;
+            // Any bytes arriving keep the dead-link check happy, not only whole packets (slow links, big frames).
+            Stream reader = new ActivityStream(sessionStream, () => Interlocked.Exchange(ref _lastPacketTicks, Stopwatch.GetTimestamp()));
             try
             {
                 while (!ct.IsCancellationRequested && _isConnected)
                 {
-                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(sessionStream, ct, sessionSec);
+                    KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(reader, ct, sessionSec);
                     if (pkt == null)
                     {
                         endReason = SessionEndReason.HostClosed;
@@ -1132,15 +1160,23 @@ namespace TurboClient
             _btnConnect.Text = "✖ Stop reconnecting";
             _btnConnect.BackColor = Color.FromArgb(195, 110, 30);
 
-            string dial = target.HostInput;
-            if (!string.IsNullOrEmpty(target.MachineName) && !string.Equals(target.HostInput, target.MachineName, StringComparison.OrdinalIgnoreCase))
-            {
-                dial += "," + target.MachineName;
-            }
+            string fullDial = target.HostInput;
+            bool canFallBackToName = !string.IsNullOrEmpty(target.MachineName) &&
+                                     !string.Equals(target.HostInput, target.MachineName, StringComparison.OrdinalIgnoreCase);
+            if (canFallBackToName) fullDial += "," + target.MachineName;
+
+            // An address typed by hand can later belong to another TurboRemote PC (DHCP), and a typed IP usually
+            // wins the race against the name. When that PC refuses the key or turns out to be a different PC,
+            // the next attempt dials the Host's own name alone. Only that one attempt: the right PC may come back
+            // at the typed address, and an unresolvable name must not hide it.
+            bool nameOnlyNext = false;
+            AuthRefusedException firstRefusal = null;
 
             for (int attempt = 1; !ct.IsCancellationRequested; attempt++)
             {
                 _reconnectAttempt = attempt;
+                string dial = nameOnlyNext ? target.MachineName : fullDial;
+                nameOnlyNext = false;
                 try
                 {
                     for (int left = ReconnectSchedule.DelayBeforeAttemptMs(attempt); left > 0; left -= 250)
@@ -1166,13 +1202,38 @@ namespace TurboClient
                 }
                 catch (AuthRefusedException ex)
                 {
+                    // Refused at the typed address: possibly not our PC any more. One try by name decides it; a
+                    // refusal there too means the key really is wrong (two attempts, well below any lockout).
+                    if (canFallBackToName && firstRefusal == null)
+                    {
+                        firstRefusal = ex;
+                        nameOnlyNext = true;
+                        continue;
+                    }
                     StopReconnecting("● RECONNECT STOPPED: " + ex.Message);
                     return;
+                }
+                catch (WrongHostException)
+                {
+                    if (!_isConnected) CloseSessionSocket();
+                    if (ct.IsCancellationRequested) return;
+                    if (firstRefusal != null)
+                    {
+                        StopReconnecting("● RECONNECT STOPPED: " + firstRefusal.Message);
+                        return;
+                    }
+                    nameOnlyNext = canFallBackToName;
                 }
                 catch (Exception)
                 {
                     if (!_isConnected) CloseSessionSocket(); // a half-finished attempt
                     if (ct.IsCancellationRequested) return;
+                    // The name led nowhere, so the refusal at the typed address stands: the key is wrong there.
+                    if (firstRefusal != null)
+                    {
+                        StopReconnecting("● RECONNECT STOPPED: " + firstRefusal.Message);
+                        return;
+                    }
                 }
             }
         }
@@ -1190,6 +1251,7 @@ namespace TurboClient
             CancellationTokenSource cts = _reconnectCts;
             _reconnectCts = null;
             try { if (cts != null) cts.Cancel(); } catch { }
+            if (!_isConnected) CloseSessionSocket(); // an attempt still signing in
             _isReconnecting = false;
             ResetConnectButton();
             if (message != null)
