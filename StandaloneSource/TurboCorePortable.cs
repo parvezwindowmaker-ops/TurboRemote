@@ -1985,6 +1985,24 @@ namespace TurboCore
 
     public static class NetworkHelper
     {
+        /// <summary>
+        /// TCP keep-alive: the OS probes an idle connection after <paramref name="idleMs"/>, then every
+        /// <paramref name="intervalMs"/>, so a dead path fails the socket instead of hanging it forever.
+        /// </summary>
+        public static void EnableKeepAlive(Socket s, int idleMs = 15000, int intervalMs = 5000)
+        {
+            try
+            {
+                s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                byte[] values = new byte[12];
+                BitConverter.GetBytes(1u).CopyTo(values, 0);
+                BitConverter.GetBytes((uint)idleMs).CopyTo(values, 4);
+                BitConverter.GetBytes((uint)intervalMs).CopyTo(values, 8);
+                s.IOControl(IOControlCode.KeepAliveValues, values, null);
+            }
+            catch { }
+        }
+
         public static List<string> GetLocalIpAddresses()
         {
             List<string> ips = new List<string>();

@@ -785,6 +785,7 @@ namespace TurboClient
         {
             _tcpClient = client;
             _tcpClient.NoDelay = true;
+            NetworkHelper.EnableKeepAlive(_tcpClient.Client);
             _tcpClient.ReceiveBufferSize = 256 * 1024;
             _tcpClient.SendBufferSize = 256 * 1024;
             _stream = _tcpClient.GetStream();

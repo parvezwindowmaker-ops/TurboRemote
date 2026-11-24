@@ -66,6 +66,25 @@ namespace TurboHost
             _config.ApplyPreset(BandwidthProfile.AutoAdaptive);
         }
 
+        // Every viewer (old builds too) pings once a second. A session that has sent nothing for this long is
+        // dead (network gone, viewer frozen); before, it stayed open until TCP gave up, which could take forever.
+        public const int ViewerSilenceTimeoutMs = 45000;
+        private long _lastReceivedTicks = Stopwatch.GetTimestamp();
+
+        private async Task SilenceWatchdogAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(5000, ct);
+                long silentMs = (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastReceivedTicks)) * 1000 / Stopwatch.Frequency;
+                if (silentMs >= ViewerSilenceTimeoutMs)
+                {
+                    _log("[Session] No data from the viewer for " + (ViewerSilenceTimeoutMs / 1000) + " s; closing the session.");
+                    return; // RunAsync then tears the session down (releasing any keys the viewer held)
+                }
+            }
+        }
+
         public async Task RunAsync(CancellationToken parentCt)
         {
             using (CancellationTokenSource sessionCts = CancellationTokenSource.CreateLinkedTokenSource(parentCt))
@@ -73,8 +92,9 @@ namespace TurboHost
                 CancellationToken ct = sessionCts.Token;
                 Task screenTask = Task.Run(() => ScreenStreamingLoopAsync(ct), ct);
                 Task receiveTask = Task.Run(() => CommandReceiveLoopAsync(ct), ct);
+                Task watchdogTask = Task.Run(() => SilenceWatchdogAsync(ct), ct);
 
-                await Task.WhenAny(screenTask, receiveTask);
+                await Task.WhenAny(screenTask, receiveTask, watchdogTask);
                 sessionCts.Cancel();
 
                 // Close the socket so the other loop's pending read/write fails fast, then wait for BOTH loops
@@ -244,6 +264,7 @@ namespace TurboHost
             {
                 KeyValuePair<PacketType, byte[]>? pkt = await TurboProtocol.ReadPacketAsync(_stream, ct, _sec);
                 if (pkt == null) break;
+                Interlocked.Exchange(ref _lastReceivedTicks, Stopwatch.GetTimestamp());
 
                 PacketType type = pkt.Value.Key;
                 byte[] data = pkt.Value.Value;
@@ -1709,6 +1730,7 @@ namespace TurboHost
                 client.NoDelay = true;
                 client.SendBufferSize = 256 * 1024;
                 client.ReceiveBufferSize = 256 * 1024;
+                NetworkHelper.EnableKeepAlive(client.Client);
 
                 using (NetworkStream stream = client.GetStream())
                 using (SemaphoreSlim writeLock = new SemaphoreSlim(1, 1))
