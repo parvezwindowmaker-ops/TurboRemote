@@ -12,6 +12,16 @@ class ReconnectTests
     static bool Reconnecting { get { return Uia.FindText(Wnd, "✖ Stop reconnecting") != null; } }
     static string Telemetry { get { return Uia.FindText(Wnd, "●") ?? ""; } }
 
+    static string Diag()
+    {
+        _viewer.Refresh();
+        IntPtr w = Wnd;
+        int count = -1;
+        try { count = System.Windows.Automation.AutomationElement.FromHandle(w).FindAll(System.Windows.Automation.TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition).Count; }
+        catch (Exception ex) { Console.WriteLine("      uia error: " + ex.GetType().Name + ": " + ex.Message); }
+        return string.Format(" [wnd=0x{0:X} exited={1} title='{2}' uiaElements={3}]", w.ToInt64(), _viewer.HasExited, Uia.WindowTitle(_viewer), count);
+    }
+
     static int Main(string[] args)
     {
         TestKit.Init(args);
@@ -54,7 +64,7 @@ class ReconnectTests
             host.StopListening();
             host.CloseSession();
             Thread.Sleep(65000);
-            TestKit.Check("still retrying after a 65 s outage", Reconnecting, Telemetry);
+            TestKit.Check("still retrying after a 65 s outage", Reconnecting, Telemetry + Diag());
             host.StartListening();
             Stopwatch outage = Stopwatch.StartNew();
             TestKit.Check("reconnects within 7 s of the Host coming back", TestKit.WaitUntil(() => host.SessionsAccepted == 4, 7000), outage.ElapsedMilliseconds + " ms");
