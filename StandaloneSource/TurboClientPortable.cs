@@ -216,14 +216,21 @@ namespace TurboClient
     public class ClientMainForm : Form
     {
         private TextBox _txtHostIp;
-        private TextBox _txtPort;
         private TextBox _txtPin;
         private Button _btnConnect;
-        private Button _btnListenReverse;
         private ComboBox _cmbBandwidth;
-        private CheckBox _chkGrayscale;
         private ComboBox _cmbMonitor;
         private Label _lblTelemetry;
+        // Refresh, clipboard, lock and restart-as-admin: only shown while connected.
+        private Control[] _sessionTools = new Control[0];
+        private bool _fillingScreenList;
+        // The port the Host listens on unless started with --port; "address:port" in the box overrides it.
+        private int _defaultPort = 9876;
+
+        // Quality choices, in the order shown, and the Host's profile number for each (the wire format keeps
+        // the old order: 0 = 2G, 1 = 3G, 2 = 4G, 3 = LAN, 4 = Auto).
+        private static readonly string[] QualityNames = { "Auto (recommended)", "2G — very slow", "3G — weak Wi-Fi", "4G — normal internet", "LAN — fast" };
+        private static readonly byte[] QualityProfiles = { 4, 0, 1, 2, 3 };
 
         private TabControl _tabControl;
         private DoubleBufferedPanel _screenCanvas;
@@ -241,7 +248,6 @@ namespace TurboClient
         private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
         private CancellationTokenSource _sessionCts;
         private CancellationTokenSource _connectCts;
-        private TcpListener _reverseListener;
         private bool _isConnected = false;
         private bool _isConnecting = false;
         private bool _remoteInputLocked = false;
@@ -275,7 +281,7 @@ namespace TurboClient
         private Button _btnLockInput;
         private Label _lblNotice;
 
-        // Auto-reconnect. What to redial after a session ends without the user asking (never for Listen Mode),
+        // Auto-reconnect. What to redial after a session ends without the user asking,
         // and the state shown while it retries.
         private sealed class ReconnectTarget
         {
@@ -338,105 +344,54 @@ namespace TurboClient
                 BackColor = Color.FromArgb(24, 28, 40)
             };
 
-            Label lblHost = new Label { Text = "Smart Route / IP:", Location = new Point(12, 13), AutoSize = true };
+            Label lblHost = new Label { Text = "Host ID or address:", Location = new Point(12, 13), AutoSize = true };
             _txtHostIp = new TextBox
             {
                 Text = "AUTO",
-                Location = new Point(120, 10),
-                Width = 145,
+                Location = new Point(140, 10),
+                Width = 200,
                 BackColor = Color.FromArgb(16, 18, 26),
                 ForeColor = Color.FromArgb(110, 225, 255),
                 Font = new Font("Consolas", 9.5f, FontStyle.Bold),
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            Label lblPort = new Label { Text = "Port:", Location = new Point(272, 13), AutoSize = true };
-            _txtPort = new TextBox
-            {
-                Text = "9876",
-                Location = new Point(308, 10),
-                Width = 58,
-                BackColor = Color.FromArgb(16, 18, 26),
-                ForeColor = Color.White,
-                Font = new Font("Consolas", 9.5f),
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            Label lblPin = new Label { Text = "PIN:", Location = new Point(374, 13), AutoSize = true };
+            Label lblPin = new Label { Text = "Access key:", Location = new Point(352, 13), AutoSize = true };
             // Each Host has its own random access key now; there is no shared default to pre-fill.
             _txtPin = new TextBox
             {
                 Text = "",
-                Location = new Point(406, 10),
-                Width = 65,
+                Location = new Point(432, 10),
+                Width = 150,
                 BackColor = Color.FromArgb(16, 18, 26),
                 ForeColor = Color.FromArgb(130, 255, 165),
                 Font = new Font("Consolas", 9.5f, FontStyle.Bold),
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            _btnConnect = CreateToolbarButton("⚡ Connect to Host", 482, 8, 145, 28, Color.FromArgb(30, 145, 90));
+            _btnConnect = CreateToolbarButton("⚡ Connect", 592, 8, 150, 28, Color.FromArgb(30, 145, 90));
             _btnConnect.Click += async (s, e) => await ToggleConnectAsync();
 
-            _btnListenReverse = CreateToolbarButton("📡 Listen Mode (9877)", 634, 8, 155, 28, Color.FromArgb(95, 65, 160));
-            _btnListenReverse.Click += async (s, e) => await StartReverseListenerAsync();
-
-            Label lblMode = new Label { Text = "Profile:", Location = new Point(798, 13), AutoSize = true };
+            Label lblMode = new Label { Text = "Quality:", Location = new Point(756, 13), AutoSize = true };
             _cmbBandwidth = new ComboBox
             {
-                Location = new Point(850, 10),
-                Width = 235,
+                Location = new Point(812, 10),
+                Width = 190,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(16, 18, 26),
                 ForeColor = Color.FromArgb(255, 220, 120)
             };
-            _cmbBandwidth.Items.AddRange(new object[]
-            {
-                "0: Ultra-Low 2G (42% Gray 22 FPS)",
-                "1: Low 3G / Weak Wi-Fi (55% 32 FPS)",
-                "2: Balanced 4G / WAN (75% 45 FPS)",
-                "3: Turbo LAN / Broadband (100% 60 FPS)",
-                "4: Auto-Adaptive Smart (20-60 FPS)"
-            });
-            _cmbBandwidth.SelectedIndex = 4; // Default to Auto-Adaptive Smart Speed
+            _cmbBandwidth.Items.AddRange(QualityNames);
+            _cmbBandwidth.SelectedIndex = 0; // Auto
             _cmbBandwidth.SelectedIndexChanged += async (s, e) => await SendStreamConfigAsync();
             _cmbBandwidth.DropDownClosed += (s, e) => FocusSelectedTabSoon();
 
-            _chkGrayscale = new CheckBox
-            {
-                Text = "Gray",
-                Location = new Point(1095, 12),
-                AutoSize = true,
-                ForeColor = Color.FromArgb(190, 205, 230)
-            };
-            _chkGrayscale.CheckedChanged += async (s, e) => await SendStreamConfigAsync();
-            _chkGrayscale.CheckedChanged += (s, e) => FocusSelectedTabSoon();
-
-            // The session buttons never take keyboard focus: after clicking one, typing keeps going to the
-            // remote PC (and Space/Enter cannot re-press the button, e.g. "Task Mgr", by accident).
-            Button btnRefreshFrame = CreateToolbarButton("🔄 Keyframe", 12, 46, 94, 28, Color.FromArgb(50, 70, 105), false);
+            // Second row: session tools, shown only while connected (see ShowSessionTools). They never take
+            // keyboard focus, so after clicking one, typing keeps going to the remote PC.
+            Button btnRefreshFrame = CreateToolbarButton("↻ Refresh", 12, 46, 90, 28, Color.FromArgb(50, 70, 105), false);
             btnRefreshFrame.Click += async (s, e) => await SendPacketSafeAsync(PacketType.ForceFullFrame, new byte[0]);
 
-            Button btnElevateHost = CreateToolbarButton("🛡 Elevate Host UAC", 112, 46, 134, 28, Color.FromArgb(175, 105, 30), false);
-            btnElevateHost.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("ELEVATE_ADMIN"));
-
-            _btnLockInput = CreateToolbarButton("🔒 Lock Host Input", 252, 46, 125, 28, Color.FromArgb(135, 55, 75), false);
-            _btnLockInput.Click += async (s, e) =>
-            {
-                if (!_isConnected) return;
-                _remoteInputLocked = !_remoteInputLocked;
-                _btnLockInput.Text = _remoteInputLocked ? "🔓 Unlock Input" : "🔒 Lock Host Input";
-                string cmd = _remoteInputLocked ? "LOCK_INPUT_ON" : "LOCK_INPUT_OFF";
-                await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes(cmd));
-            };
-
-            Button btnTaskMgr = CreateToolbarButton("📊 Task Mgr", 383, 46, 92, 28, Color.FromArgb(55, 65, 95), false);
-            btnTaskMgr.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("TASK_MGR"));
-
-            Button btnShowDesktop = CreateToolbarButton("🖥 Win+D", 481, 46, 78, 28, Color.FromArgb(55, 65, 95), false);
-            btnShowDesktop.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("WIN_D"));
-
-            Button btnPushClip = CreateToolbarButton("📋 Push Clip", 565, 46, 95, 28, Color.FromArgb(55, 65, 95), false);
+            Button btnPushClip = CreateToolbarButton("📋 Send clipboard", 108, 46, 128, 28, Color.FromArgb(55, 65, 95), false);
             btnPushClip.Click += async (s, e) =>
             {
                 if (Clipboard.ContainsText())
@@ -445,26 +400,44 @@ namespace TurboClient
                 }
             };
 
-            Button btnPullClip = CreateToolbarButton("📥 Pull Clip", 666, 46, 95, 28, Color.FromArgb(55, 65, 95), false);
+            Button btnPullClip = CreateToolbarButton("📥 Get clipboard", 242, 46, 120, 28, Color.FromArgb(55, 65, 95), false);
             btnPullClip.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("GET_CLIPBOARD"));
 
+            _btnLockInput = CreateToolbarButton("🔒 Lock host input", 368, 46, 140, 28, Color.FromArgb(135, 55, 75), false);
+            _btnLockInput.Click += async (s, e) =>
+            {
+                if (!_isConnected) return;
+                _remoteInputLocked = !_remoteInputLocked;
+                _btnLockInput.Text = _remoteInputLocked ? "🔓 Unlock host input" : "🔒 Lock host input";
+                string cmd = _remoteInputLocked ? "LOCK_INPUT_ON" : "LOCK_INPUT_OFF";
+                await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes(cmd));
+            };
+
+            Button btnElevateHost = CreateToolbarButton("🛡 Restart host as admin", 514, 46, 170, 28, Color.FromArgb(175, 105, 30), false);
+            btnElevateHost.Click += async (s, e) => await SendPacketSafeAsync(PacketType.SystemAction, Encoding.UTF8.GetBytes("ELEVATE_ADMIN"));
+
+            // Only when the Host reports more than one screen (sign-in reply, field 4).
             _cmbMonitor = new ComboBox
             {
-                Location = new Point(768, 48),
-                Width = 92,
+                Location = new Point(690, 48),
+                Width = 96,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(16, 18, 26),
-                ForeColor = Color.White
+                ForeColor = Color.White,
+                Visible = false
             };
-            _cmbMonitor.Items.AddRange(new object[] { "Monitor 1", "Monitor 2", "Monitor 3" });
+            _cmbMonitor.Items.Add("Screen 1");
             _cmbMonitor.SelectedIndex = 0;
             _cmbMonitor.SelectedIndexChanged += async (s, e) => await SendStreamConfigAsync();
             _cmbMonitor.DropDownClosed += (s, e) => FocusSelectedTabSoon();
 
+            _sessionTools = new Control[] { btnRefreshFrame, btnPushClip, btnPullClip, _btnLockInput, btnElevateHost };
+            foreach (Control c in _sessionTools) c.Visible = false;
+
             _lblTelemetry = new Label
             {
                 Text = "● DISCONNECTED",
-                Location = new Point(868, 52),
+                Location = new Point(14, 52),
                 AutoSize = true,
                 Font = new Font("Consolas", 8.8f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(255, 185, 90)
@@ -472,9 +445,8 @@ namespace TurboClient
 
             topBar.Controls.AddRange(new Control[]
             {
-                lblHost, _txtHostIp, lblPort, _txtPort, lblPin, _txtPin,
-                _btnConnect, _btnListenReverse, lblMode, _cmbBandwidth, _chkGrayscale,
-                btnRefreshFrame, btnElevateHost, _btnLockInput, btnTaskMgr, btnShowDesktop, btnPushClip, btnPullClip, _cmbMonitor, _lblTelemetry
+                lblHost, _txtHostIp, lblPin, _txtPin, _btnConnect, lblMode, _cmbBandwidth,
+                btnRefreshFrame, btnPushClip, btnPullClip, _btnLockInput, btnElevateHost, _cmbMonitor, _lblTelemetry
             });
 
             _tabControl = new TabControl
@@ -483,7 +455,7 @@ namespace TurboClient
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
             };
 
-            TabPage tabDesktop = new TabPage("🖥 Live Remote Desktop (8x8 Delta-Tile Stream)")
+            TabPage tabDesktop = new TabPage("🖥 Remote Desktop")
             {
                 BackColor = Color.FromArgb(10, 12, 16)
             };
@@ -507,13 +479,13 @@ namespace TurboClient
 
             tabDesktop.Controls.Add(_screenCanvas);
 
-            TabPage tabTerminal = new TabPage("💻 Zero-Bandwidth Remote PowerShell")
+            TabPage tabTerminal = new TabPage("💻 PowerShell")
             {
                 BackColor = Color.FromArgb(14, 16, 22)
             };
             BuildTerminalTab(tabTerminal);
 
-            TabPage tabFiles = new TabPage("📁 Ultra-Fast File Manager & Transfer")
+            TabPage tabFiles = new TabPage("📁 Files")
             {
                 BackColor = Color.FromArgb(18, 21, 30)
             };
@@ -597,8 +569,8 @@ namespace TurboClient
                 Font = new Font("Consolas", 10f),
                 ReadOnly = true,
                 BorderStyle = BorderStyle.None,
-                Text = "=== TurboRemote Zero-Bandwidth PowerShell Console ===\n" +
-                       "Executes administrative commands remotely using < 1 KB of compressed text even on 2G links.\n\n"
+                Text = "Remote PowerShell. Type a command below and press Enter; it runs on the Host PC.\n" +
+                       "Works even on very slow links, because only text is sent.\n\n"
             };
 
             tab.Controls.Add(_rtbTerminalOutput);
@@ -679,7 +651,7 @@ namespace TurboClient
         public void AutoConnectOnStartup(string host, int port, string pin)
         {
             _txtHostIp.Text = host;
-            _txtPort.Text = port.ToString();
+            _defaultPort = port;
             _txtPin.Text = pin;
             Shown += async (s, e) => await ConnectToHostAsync();
         }
@@ -707,15 +679,10 @@ namespace TurboClient
             Disconnect();
 
             string hostInput = _txtHostIp.Text.Trim();
-            int port;
-            if (!int.TryParse(_txtPort.Text.Trim(), out port))
-            {
-                MessageBox.Show("Invalid TCP port number.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            int port = _defaultPort;
             if (_txtPin.Text.Trim().Length == 0)
             {
-                MessageBox.Show("Enter the Host's access key (shown in the Host window next to 'Access Key/PIN').", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Enter the Host's access key (shown in the Host window under 'Connect to this PC').", "TurboRemote", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -778,51 +745,44 @@ namespace TurboClient
             }
         }
 
+        /// <summary>
+        /// Shows the second toolbar row while connected (and the screen picker when the Host has more than one
+        /// screen); while disconnected that row holds only the status line.
+        /// </summary>
+        private void ShowSessionTools(bool connected, int screenCount)
+        {
+            foreach (Control c in _sessionTools) c.Visible = connected;
+
+            if (connected)
+            {
+                // Refilled on every sign-in: a reconnect keeps the chosen screen, another Host may have fewer.
+                int count = Math.Max(1, screenCount);
+                int keep = _cmbMonitor.SelectedIndex;
+                _fillingScreenList = true;
+                try
+                {
+                    _cmbMonitor.Items.Clear();
+                    for (int i = 1; i <= count; i++) _cmbMonitor.Items.Add("Screen " + i);
+                    _cmbMonitor.SelectedIndex = keep >= 0 && keep < count ? keep : 0;
+                }
+                finally
+                {
+                    _fillingScreenList = false;
+                }
+            }
+            _cmbMonitor.Visible = connected && screenCount > 1;
+
+            int right = _cmbMonitor.Visible ? _cmbMonitor.Right
+                      : _sessionTools.Length > 0 ? _sessionTools[_sessionTools.Length - 1].Right : 0;
+            _lblTelemetry.Location = connected ? new Point(right + 14, 52) : new Point(14, 52);
+        }
+
         private void ResetConnectButton()
         {
             _isConnecting = false;
             _btnConnect.Enabled = true;
-            _btnConnect.Text = "⚡ Connect to Host";
+            _btnConnect.Text = "⚡ Connect";
             _btnConnect.BackColor = Color.FromArgb(30, 145, 90);
-        }
-
-        private async Task StartReverseListenerAsync()
-        {
-            try
-            {
-                if (_reverseListener != null)
-                {
-                    _reverseListener.Stop();
-                    _reverseListener = null;
-                    _btnListenReverse.Text = "📡 Listen Mode (9877)";
-                    return;
-                }
-
-                _reverseListener = new TcpListener(IPAddress.Any, 9877);
-                _reverseListener.Start();
-                _btnListenReverse.Text = "⏳ Waiting on 9877...";
-                _lblTelemetry.Text = "● LISTENING ON PORT 9877 FOR OUTBOUND HOST...";
-
-                TcpClient client = await _reverseListener.AcceptTcpClientAsync();
-                _reverseListener.Stop();
-                _reverseListener = null;
-                _btnListenReverse.Text = "📡 Listen Mode (9877)";
-
-                // Replacing a live session in place left its receive loop reading the new stream.
-                if (_isConnected || _isConnecting || _isReconnecting) Disconnect();
-                _reconnectTarget = null; // the Host dials in here; there is nothing for this viewer to redial
-
-                await InitializeActiveSessionAsync(client, new EndpointCandidate
-                {
-                    Host = client.Client.RemoteEndPoint.ToString(),
-                    Port = 9877,
-                    RouteLabel = "Reverse Outbound WAN"
-                }, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _lblTelemetry.Text = "● Listen Mode Stopped: " + ex.Message;
-            }
         }
 
         /// <summary>
@@ -922,9 +882,13 @@ namespace TurboClient
                 throw new WrongHostException("A different PC (" + remoteMachine + ") answered instead of " + expectedMachine + ".");
             }
 
+            int screenCount;
+            if (parts.Length <= 3 || !int.TryParse(parts[3], out screenCount)) screenCount = 1;
+
             _connectedMachine = remoteMachine;
             Interlocked.Exchange(ref _lastPacketTicks, Stopwatch.GetTimestamp());
             _isConnected = true;
+            ShowSessionTools(true, screenCount);
             _btnConnect.Text = "⏹ Disconnect";
             _btnConnect.BackColor = Color.FromArgb(185, 55, 55);
             string routeInfo = winningRoute != null ? string.Format("{0} ({1}:{2})", winningRoute.RouteLabel, winningRoute.Host, winningRoute.Port) : "Direct";
@@ -995,7 +959,8 @@ namespace TurboClient
             _remoteButtonsDown.Clear();
             // The Host unlocks its input when a session ends; the button must not keep saying "Unlock".
             _remoteInputLocked = false;
-            _btnLockInput.Text = "🔒 Lock Host Input";
+            _btnLockInput.Text = "🔒 Lock host input";
+            ShowSessionTools(false, 0);
             _lblNotice.Visible = false;
             try { if (_connectCts != null) _connectCts.Cancel(); } catch { }
             try { if (_sessionCts != null) _sessionCts.Cancel(); } catch { }
@@ -1314,8 +1279,8 @@ namespace TurboClient
             using (Font font = new Font("Segoe UI", 12f, FontStyle.Bold))
             {
                 string msg = _isConnected
-                    ? "Connected — Receiving first Delta Screen Frame..."
-                    : "Enter Host IP & PIN above and click '⚡ Connect to Host' to start ultra-low bandwidth streaming.";
+                    ? "Connected — waiting for the first picture…"
+                    : "Type the Host ID and access key above, then click '⚡ Connect'.";
                 SizeF sz = e.Graphics.MeasureString(msg, font);
                 e.Graphics.DrawString(msg, font, brush,
                     Math.Max(20, (_screenCanvas.Width - sz.Width) / 2),
@@ -1551,9 +1516,11 @@ namespace TurboClient
         {
             if (!_isConnected) return;
             byte[] cfg = new byte[5];
-            cfg[0] = (byte)_cmbBandwidth.SelectedIndex;
-            cfg[1] = (byte)_cmbMonitor.SelectedIndex;
-            cfg[2] = (byte)(_chkGrayscale.Checked ? 1 : 0);
+            if (_fillingScreenList) return;
+            int quality = Math.Max(0, Math.Min(QualityProfiles.Length - 1, _cmbBandwidth.SelectedIndex));
+            cfg[0] = QualityProfiles[quality];
+            cfg[1] = (byte)Math.Max(0, _cmbMonitor.SelectedIndex);
+            cfg[2] = 0; // colour (grayscale was removed from the UI)
             cfg[3] = 0;
             cfg[4] = 0;
             await SendPacketSafeAsync(PacketType.ConfigUpdate, cfg);
@@ -1747,7 +1714,7 @@ namespace TurboClient
                 }
                 else
                 {
-                    _lblTelemetry.Text = string.Format("● LIVE | FPS: {0} | Stream In: {1:F1} KB/s | Ping: {2} ms", _currentFps, _currentKbps, _lastPingRttMs);
+                    _lblTelemetry.Text = string.Format("● LIVE · {0} fps · {1:F1} KB/s · {2} ms", _currentFps, _currentKbps, _lastPingRttMs);
                     _lblTelemetry.ForeColor = _currentKbps < 80
                         ? Color.FromArgb(110, 255, 165)
                         : Color.FromArgb(110, 215, 255);

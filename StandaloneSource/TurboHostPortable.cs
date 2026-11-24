@@ -740,19 +740,18 @@ namespace TurboHost
 
     public class HostMainForm : Form
     {
-        private TextBox _txtPort;
+        // The port is not in the window any more (it almost never changes); --port sets it.
+        private int _port = 9876;
+        // The Host ID is this PC's name: viewers find it by that name on the LAN and over Tailscale.
+        private static readonly string HostId = Environment.MachineName.ToUpperInvariant();
+
         private TextBox _txtPin;
-        private TextBox _txtRoomId;
         private string _activePublicTunnelEndpoint = "";
         private Button _btnStartStop;
         private Button _btnElevate;
-        private Button _btnAutoStartup;
-        private Button _btnUpnp;
-        private Button _btnFirewall;
-        private TextBox _txtRelayHost;
-        private TextBox _txtRelayPort;
-        private Button _btnConnectRelay;
-        private ListBox _lstEndpoints;
+        private CheckBox _chkAutoStart;
+        private bool _updatingAutoStartBox;
+        private Label _lblLan;
         private ListBox _lstLog;
         private Label _lblStatus;
         private Label _lblAdminBadge;
@@ -790,7 +789,7 @@ namespace TurboHost
         public HostMainForm()
         {
             Text = "TurboRemote — Host Server  v" + TurboProtocol.AppVersion;
-            Size = new Size(775, 645);
+            Size = new Size(775, 600);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(18, 20, 28);
             ForeColor = Color.FromArgb(230, 235, 245);
@@ -805,8 +804,8 @@ namespace TurboHost
 
             NativeInputInjector.PreventSystemSleep();
             InitializeUi();
-            PopulateNetworkEndpoints();
             UpdateAdminBadge();
+            Shown += async (s, e) => await RefreshAutoStartBoxAsync();
 
             _tailscaleTimer = new System.Windows.Forms.Timer { Interval = 30000 };
             _tailscaleTimer.Tick += async (s, e) => await RefreshTailscaleAsync();
@@ -819,68 +818,84 @@ namespace TurboHost
             Panel headerPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 62,
+                Height = 58,
                 BackColor = Color.FromArgb(26, 30, 44)
             };
 
             Label lblTitle = new Label
             {
-                Text = "⚡ TURBOREMOTE",
+                Text = "⚡ TurboRemote Host",
                 Font = new Font("Segoe UI", 13f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(88, 196, 255),
-                Location = new Point(16, 10),
-                AutoSize = true
-            };
-
-            Label lblSub = new Label
-            {
-                Text = "Runs on Any Windows PC Without .NET Core or Python Installed • 2G Low-Bit Delta Engine • Full Admin UAC",
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(160, 175, 200),
-                Location = new Point(18, 36),
+                Location = new Point(16, 16),
                 AutoSize = true
             };
 
             _lblAdminBadge = new Label
             {
-                Location = new Point(555, 16),
-                Size = new Size(190, 30),
+                Text = "🛡 Running as admin",
+                Location = new Point(565, 16),
+                Size = new Size(180, 28),
                 TextAlign = ContentAlignment.MiddleCenter,
-                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
+                BackColor = Color.FromArgb(25, 110, 65),
+                ForeColor = Color.FromArgb(180, 255, 200)
             };
 
-            headerPanel.Controls.Add(lblTitle);
-            headerPanel.Controls.Add(lblSub);
-            headerPanel.Controls.Add(_lblAdminBadge);
+            // Admin rights let the viewer control elevated windows, UAC prompts and Task Manager, lock this PC's
+            // input, and let the Host open Windows Firewall for its port.
+            _btnElevate = CreateButton("🛡 Run as admin", 565, 14, 180, 32, Color.FromArgb(190, 115, 30));
+            _btnElevate.Click += (s, e) =>
+            {
+                if (NativeInputInjector.RestartAsAdmin(BuildElevatedRestartArgs()))
+                {
+                    Application.Exit();
+                }
+            };
+
+            headerPanel.Controls.AddRange(new Control[] { lblTitle, _lblAdminBadge, _btnElevate });
             Controls.Add(headerPanel);
 
-            GroupBox grpServer = CreateGroupBox("1. Host Listen, UAC Elevation & Unattended Auto-Start", 16, 72, 430, 172);
+            GroupBox grpConnect = CreateGroupBox("Connect to this PC", 16, 70, 727, 196);
 
-            Label lblPort = new Label { Text = "TCP Listen Port:", Location = new Point(16, 28), AutoSize = true };
-            _txtPort = new TextBox
+            Label lblHostId = new Label { Text = "Host ID:", Location = new Point(16, 30), AutoSize = true };
+            Label lblHostIdValue = new Label
             {
-                Text = "9876",
-                Location = new Point(135, 25),
-                Width = 90,
-                BackColor = Color.FromArgb(30, 35, 50),
-                ForeColor = Color.White,
-                BorderStyle = BorderStyle.FixedSingle
+                Text = HostId,
+                Location = new Point(120, 27),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(255, 230, 130),
+                Font = new Font("Consolas", 11f, FontStyle.Bold)
+            };
+            _lblLan = new Label
+            {
+                Location = new Point(300, 30),
+                Size = new Size(290, 20),
+                ForeColor = Color.FromArgb(150, 165, 190),
+                Font = new Font("Segoe UI", 8.6f),
+                Text = DescribeLanAddress()
+            };
+            Button btnCopyHostId = CreateButton("📋 Copy", 612, 24, 100, 28, Color.FromArgb(35, 130, 85));
+            btnCopyHostId.Click += (s, e) =>
+            {
+                try { Clipboard.SetText(HostId); } catch { }
+                Log("[Host ID] Copied " + HostId + ". In the viewer, type it in 'Host ID or address'.");
             };
 
-            Label lblPin = new Label { Text = "Access Key/PIN:", Location = new Point(16, 60), AutoSize = true };
+            Label lblPin = new Label { Text = "Access key:", Location = new Point(16, 66), AutoSize = true };
             _txtPin = new TextBox
             {
                 Text = _savedAccessKey,
-                Location = new Point(135, 57),
-                Width = 72,
+                Location = new Point(120, 62),
+                Width = 180,
                 BackColor = Color.FromArgb(30, 35, 50),
                 ForeColor = Color.FromArgb(120, 255, 160),
-                Font = new Font("Consolas", 10f, FontStyle.Bold),
+                Font = new Font("Consolas", 11f, FontStyle.Bold),
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            // A key edited while the server runs is applied once typing pauses: Internet access turns off for a
-            // weak key and back on for a strong one, without passing through every half-typed key.
+            // A key edited while sharing is applied once typing pauses: Internet access turns off for a weak key
+            // and back on for a strong one, without passing through every half-typed key.
             _keyApplyTimer = new System.Windows.Forms.Timer { Interval = 1500 };
             _keyApplyTimer.Tick += (s, e) =>
             {
@@ -894,7 +909,7 @@ namespace TurboHost
                 _keyApplyTimer.Start();
             };
 
-            Button btnGenKey = CreateButton("🎲", 210, 56, 28, 25, Color.FromArgb(65, 85, 130));
+            Button btnGenKey = CreateButton("🎲 New key", 310, 60, 110, 28, Color.FromArgb(65, 85, 130));
             btnGenKey.Click += (s, e) =>
             {
                 _txtPin.Text = TurboProtocol.GenerateStrongAccessKey();
@@ -902,151 +917,23 @@ namespace TurboHost
                 RememberAccessKey(_txtPin.Text);
             };
 
-            _btnStartStop = CreateButton("▶ Start Host Server", 242, 24, 172, 34, Color.FromArgb(34, 155, 95));
-            _btnStartStop.Click += async (s, e) => await ToggleServerAsync();
-
-            _btnElevate = CreateButton("🛡 Elevate to Admin (UAC)", 242, 64, 172, 30, Color.FromArgb(190, 115, 30));
-            _btnElevate.Click += (s, e) =>
-            {
-                if (NativeInputInjector.IsRunningAsAdmin())
-                {
-                    MessageBox.Show("TurboHost is already running with full Administrator privileges!", "Administrator Active", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
-                }
-                if (NativeInputInjector.RestartAsAdmin(BuildElevatedRestartArgs()))
-                {
-                    Application.Exit();
-                }
-            };
-
-            _btnFirewall = CreateButton("🔓 Open Windows Firewall", 16, 100, 198, 28, Color.FromArgb(50, 75, 125));
-            _btnFirewall.Click += (s, e) =>
-            {
-                int port;
-                if (int.TryParse(_txtPort.Text, out port))
-                {
-                    bool ok = NetworkHelper.EnsureFirewallRule("TurboRemote_Host_TCP", port);
-                    Log(ok ? "[Firewall] Inbound TCP rule added for port " + port : "[Firewall] Elevate to Admin first to add firewall rule.");
-                }
-            };
-
-            _btnUpnp = CreateButton("🌐 Auto-Map UPnP Router", 222, 100, 192, 28, Color.FromArgb(65, 85, 130));
-            _btnUpnp.Click += async (s, e) =>
-            {
-                int port;
-                if (int.TryParse(_txtPort.Text, out port))
-                {
-                    Log("[UPnP] Probing router gateway...");
-                    string msg = await NetworkHelper.TryUpnpPortForwardAsync(port, port);
-                    Log("[UPnP] " + msg);
-                }
-            };
-
-            _btnAutoStartup = CreateButton("⚙ Install Unattended Admin Startup Task (Auto-Run on Boot)", 16, 134, 398, 28, Color.FromArgb(45, 95, 110));
-            _btnAutoStartup.Click += (s, e) =>
-            {
-                if (!NativeInputInjector.IsRunningAsAdmin())
-                {
-                    MessageBox.Show("Click 'Elevate to Admin (UAC)' first so Windows Task Scheduler can register the Highest-Privilege startup task.", "Admin Required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-                bool ok = NativeInputInjector.InstallUnattendedAdminStartupTask(_txtPort.Text.Trim(), _txtPin.Text.Trim());
-                Log(ok
-                    ? "[Unattended] Installed 'TurboRemote_Unattended_Host' scheduled task with HIGHEST privileges on boot!"
-                    : "[Unattended] Could not register task.");
-            };
-
-            grpServer.Controls.AddRange(new Control[] { lblPort, _txtPort, lblPin, _txtPin, btnGenKey, _btnStartStop, _btnElevate, _btnFirewall, _btnUpnp, _btnAutoStartup });
-            Controls.Add(grpServer);
-
-            GroupBox grpReverse = CreateGroupBox("2. Reverse WAN Connect (Bypass CGNAT)", 458, 72, 285, 172);
-            Label lblRevInfo = new Label
-            {
-                Text = "If this Host PC is behind strict CGNAT/Firewall, connect outbound to a Client waiting in 'Listen Mode':",
-                Location = new Point(14, 24),
-                Size = new Size(256, 38),
-                ForeColor = Color.FromArgb(170, 185, 210),
-                Font = new Font("Segoe UI", 8.2f)
-            };
-            Label lblRHost = new Label { Text = "Client IP/Host:", Location = new Point(14, 68), AutoSize = true };
-            _txtRelayHost = new TextBox
-            {
-                Text = "127.0.0.1",
-                Location = new Point(108, 65),
-                Width = 158,
-                BackColor = Color.FromArgb(30, 35, 50),
-                ForeColor = Color.White,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-            Label lblRPort = new Label { Text = "Client Port:", Location = new Point(14, 98), AutoSize = true };
-            _txtRelayPort = new TextBox
-            {
-                Text = "9877",
-                Location = new Point(108, 95),
-                Width = 80,
-                BackColor = Color.FromArgb(30, 35, 50),
-                ForeColor = Color.White,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            _btnConnectRelay = CreateButton("🚀 Connect Outbound to Client", 14, 130, 254, 30, Color.FromArgb(115, 70, 180));
-            _btnConnectRelay.Click += async (s, e) => await ConnectReverseToClientAsync();
-
-            grpReverse.Controls.AddRange(new Control[] { lblRevInfo, lblRHost, _txtRelayHost, lblRPort, _txtRelayPort, _btnConnectRelay });
-            Controls.Add(grpReverse);
-
-            GroupBox grpEndpoints = CreateGroupBox("3. Host ID, Tailscale (Permanent Address) & Connection Endpoints", 16, 252, 727, 182);
-
-            Label lblRoom = new Label { Text = "Host ID:", Location = new Point(542, 26), AutoSize = true, ForeColor = Color.FromArgb(255, 225, 130) };
-            _txtRoomId = new TextBox
-            {
-                Text = Environment.MachineName.ToUpperInvariant(),
-                Location = new Point(598, 23),
-                Width = 114,
-                BackColor = Color.FromArgb(30, 35, 50),
-                ForeColor = Color.FromArgb(255, 230, 130),
-                Font = new Font("Consolas", 9f, FontStyle.Bold),
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            _lstEndpoints = new ListBox
-            {
-                Location = new Point(14, 24),
-                Size = new Size(515, 92),
-                BackColor = Color.FromArgb(24, 28, 38),
-                ForeColor = Color.FromArgb(110, 220, 255),
-                Font = new Font("Consolas", 9.5f),
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            Button btnCopyIp = CreateButton("⚡ Copy / Publish ID", 542, 54, 170, 28, Color.FromArgb(35, 130, 85));
-            btnCopyIp.Click += async (s, e) =>
-            {
-                int port = 9876;
-                int.TryParse(_txtPort.Text.Trim(), out port);
-                string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
-                Clipboard.SetText(ticket);
-                Log("[SmartTicket] Copied endpoints to Clipboard: " + ticket);
-                await PublishTicketToCloudDirectoryAsync(true);
-            };
-
             _lblTailscale = new Label
             {
                 Text = "Tailscale: checking…",
-                Location = new Point(14, 122),
-                Size = new Size(520, 22),
+                Location = new Point(16, 104),
+                Size = new Size(580, 22),
                 TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = Color.FromArgb(170, 185, 210)
             };
 
-            _btnTailscale = CreateButton("📋 Copy Tailscale name", 542, 120, 170, 26, Color.FromArgb(45, 95, 110));
+            _btnTailscale = CreateButton("📋 Copy name", 602, 100, 110, 28, Color.FromArgb(45, 95, 110));
             _btnTailscale.Visible = false;
             _btnTailscale.Click += (s, e) => OnTailscaleButtonClicked();
 
-            // Replaces the old "Auto Internet Tunnel" button: the hourly tunnel is now a fallback.
+            // The hourly public tunnel is only a fallback for viewer PCs without Tailscale.
             _chkPublicTunnel = new CheckBox
             {
-                Location = new Point(14, 150),
+                Location = new Point(16, 140),
                 AutoSize = true,
                 ForeColor = Color.FromArgb(190, 205, 230),
                 Font = new Font("Segoe UI", 8.6f)
@@ -1054,23 +941,37 @@ namespace TurboHost
             _chkPublicTunnel.CheckedChanged += (s, e) => OnPublicTunnelBoxChanged();
             UpdateTunnelBox();
 
-            grpEndpoints.Controls.AddRange(new Control[] { _lstEndpoints, lblRoom, _txtRoomId, btnCopyIp, _lblTailscale, _btnTailscale, _chkPublicTunnel });
-            Controls.Add(grpEndpoints);
+            grpConnect.Controls.AddRange(new Control[] { lblHostId, lblHostIdValue, _lblLan, btnCopyHostId, lblPin, _txtPin, btnGenKey, _lblTailscale, _btnTailscale, _chkPublicTunnel });
+            Controls.Add(grpConnect);
 
-            GroupBox grpLog = CreateGroupBox("4. Real-Time Session Telemetry & Security Log", 16, 442, 727, 148);
+            _btnStartStop = CreateButton("▶ Start sharing", 16, 278, 170, 34, Color.FromArgb(34, 155, 95));
+            _btnStartStop.Click += async (s, e) => await ToggleServerAsync();
+
             _lblStatus = new Label
             {
-                Text = "● Server Status: STOPPED",
-                Location = new Point(14, 22),
+                Text = "● Not sharing",
+                Location = new Point(200, 287),
                 AutoSize = true,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(255, 180, 90)
             };
 
+            _chkAutoStart = new CheckBox
+            {
+                Text = "Start sharing automatically when I sign in to Windows",
+                Location = new Point(18, 322),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(190, 205, 230)
+            };
+            _chkAutoStart.CheckedChanged += (s, e) => OnAutoStartBoxChanged();
+
+            Controls.AddRange(new Control[] { _btnStartStop, _lblStatus, _chkAutoStart });
+
+            GroupBox grpLog = CreateGroupBox("Activity", 16, 350, 727, 200);
             _lblStats = new Label
             {
-                Text = "Clients: 0 | Bandwidth Out: 0.0 KB/s | Total Sent: 0.0 MB",
-                Location = new Point(315, 22),
+                Text = "Viewers: 0 | Out: 0.0 KB/s | Sent: 0.0 MB",
+                Location = new Point(14, 22),
                 AutoSize = true,
                 Font = new Font("Consolas", 9f),
                 ForeColor = Color.FromArgb(150, 220, 180)
@@ -1079,16 +980,67 @@ namespace TurboHost
             _lstLog = new ListBox
             {
                 Location = new Point(14, 46),
-                Size = new Size(698, 92),
+                Size = new Size(698, 144),
                 BackColor = Color.FromArgb(14, 16, 22),
                 ForeColor = Color.FromArgb(200, 215, 230),
                 Font = new Font("Consolas", 8.8f),
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            grpLog.Controls.AddRange(new Control[] { _lblStatus, _lblStats, _lstLog });
+            grpLog.Controls.AddRange(new Control[] { _lblStats, _lstLog });
             Controls.Add(grpLog);
         }
+
+        /// <summary>The LAN address(es) a viewer in the same office can use, for the hint next to the Host ID.</summary>
+        private static string DescribeLanAddress()
+        {
+            List<string> lan = new List<string>();
+            foreach (string ip in SmartRouteEngine.GetRawHostIps())
+            {
+                if (!TailscaleInfo.IsTailscaleAddress(ip) && !ip.StartsWith("169.254.")) lan.Add(ip);
+            }
+            return lan.Count == 0 ? "" : "on this network: " + string.Join(", ", lan.Take(2));
+        }
+
+        /// <summary>Off the UI thread: ticks the auto-start box when the sign-in task exists.</summary>
+        private async Task RefreshAutoStartBoxAsync()
+        {
+            bool installed = await Task.Run(() => NativeInputInjector.IsUnattendedStartupTaskInstalled());
+            if (IsDisposed) return;
+            _updatingAutoStartBox = true;
+            try { _chkAutoStart.Checked = installed; }
+            finally { _updatingAutoStartBox = false; }
+        }
+
+        private void OnAutoStartBoxChanged()
+        {
+            if (_updatingAutoStartBox) return;
+            bool want = _chkAutoStart.Checked;
+            if (!NativeInputInjector.IsRunningAsAdmin())
+            {
+                MessageBox.Show(this, "Starting automatically at sign-in needs administrator rights.\n\nClick '🛡 Run as admin' first, then tick the box again.",
+                    "TurboRemote Host", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                _updatingAutoStartBox = true;
+                try { _chkAutoStart.Checked = !want; }
+                finally { _updatingAutoStartBox = false; }
+                return;
+            }
+
+            bool ok = want
+                ? NativeInputInjector.InstallUnattendedAdminStartupTask(_port.ToString(), _txtPin.Text.Trim())
+                : NativeInputInjector.RemoveUnattendedStartupTask();
+            Log(ok
+                ? (want ? "[Auto-start] This PC now starts sharing automatically when you sign in to Windows."
+                        : "[Auto-start] This PC no longer starts sharing at sign-in.")
+                : "[Auto-start] Windows Task Scheduler refused the change.");
+            if (!ok)
+            {
+                _updatingAutoStartBox = true;
+                try { _chkAutoStart.Checked = !want; }
+                finally { _updatingAutoStartBox = false; }
+            }
+        }
+
 
         // ntfy.sh allows 250 messages a day per public IP and keeps them for 12 hours. Re-publishing every
         // 4 minutes (360 a day) hit that limit after ~16 hours; from then on new tunnel addresses (pinggy's
@@ -1098,22 +1050,17 @@ namespace TurboHost
         private string _lastPublishedCloudKey = "";
         private DateTime _lastCloudPublishUtc = DateTime.MinValue;
 
-        private const string TunnelListSuffix = " (Public Internet Tunnel)";
-
         /// <summary>Safe from any thread: the text boxes are read through Invoke when needed.</summary>
         private async Task PublishTicketToCloudDirectoryAsync(bool force = false)
         {
-            string portStr = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim())) : _txtPort.Text.Trim();
-            string room = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtRoomId.Text.Trim())) : _txtRoomId.Text.Trim();
+            string room = HostId;
             string pin = InvokeRequired ? (string)Invoke(new Func<string>(() => _txtPin.Text.Trim())) : _txtPin.Text.Trim();
 
             // The directory is found by Host ID (the machine name) + key: under a weak key anyone could read
             // this PC's addresses.
             if (IsInternetRefusedForKey(pin)) return;
 
-            int port = 9876;
-            int.TryParse(portStr, out port);
-            string ticket = SmartRouteEngine.BuildSmartConnectTicket(port, _activePublicTunnelEndpoint);
+            string ticket = SmartRouteEngine.BuildSmartConnectTicket(_port, _activePublicTunnelEndpoint);
 
             string publishKey = room + "|" + pin + "|" + ticket;
             if (!force && publishKey == _lastPublishedCloudKey && DateTime.UtcNow - _lastCloudPublishUtc < CloudKeepAliveInterval)
@@ -1180,8 +1127,8 @@ namespace TurboHost
         /// <summary>UI thread.</summary>
         private void ShowListeningStatus(bool internetAllowed)
         {
-            _lblStatus.Text = "● Server Status: LISTENING ON PORT " + _listenPort +
-                (internetAllowed ? " (LOCAL + INTERNET ACTIVE)" : " (LAN ONLY: ACCESS KEY TOO WEAK FOR INTERNET)");
+            _lblStatus.Text = "● Sharing on port " + _listenPort +
+                (internetAllowed ? " — LAN and Internet" : " — LAN only (access key too weak for the Internet)");
         }
 
         /// <summary>UI thread. Brings the tunnel and cloud directory in line with the key now in the box.</summary>
@@ -1326,7 +1273,7 @@ namespace TurboHost
             _updatingTunnelBox = true;
             try
             {
-                _chkPublicTunnel.Text = "Also open a public tunnel for viewers without Tailscale (address changes every hour)" +
+                _chkPublicTunnel.Text = "Also allow viewers without Tailscale (public tunnel, address changes every hour)" +
                                         (_tunnelSwitch.IsAutomatic ? " (automatic)" : "");
                 _chkPublicTunnel.Checked = _isRunning ? _tunnelWanted : TurboSettings.Get("publicTunnel", "auto") == "on";
             }
@@ -1364,11 +1311,7 @@ namespace TurboHost
                     return;
                 }
 
-                string portText = InvokeRequired
-                    ? (string)Invoke(new Func<string>(() => _txtPort.Text.Trim()))
-                    : _txtPort.Text.Trim();
-                int port;
-                if (!int.TryParse(portText, out port)) port = 9876;
+                int port = _port;
 
                 string keyError;
                 string keyPath = PublicTunnel.EnsureTunnelKey(out keyError);
@@ -1429,7 +1372,7 @@ namespace TurboHost
 
             if (!IsDisposed && IsHandleCreated && !string.IsNullOrEmpty(deadEndpoint))
             {
-                try { BeginInvoke(new Action(RemoveTunnelEndpointsFromList)); } catch (InvalidOperationException) { }
+                Log("[Auto-Tunnel] The public tunnel address " + deadEndpoint + " is gone.");
             }
 
             CancellationTokenSource cts = _serverCts;
@@ -1449,15 +1392,6 @@ namespace TurboHost
                     }
                     catch { }
                 });
-            }
-        }
-
-        private void RemoveTunnelEndpointsFromList()
-        {
-            for (int i = _lstEndpoints.Items.Count - 1; i >= 0; i--)
-            {
-                string item = _lstEndpoints.Items[i] as string;
-                if (item != null && item.EndsWith(TunnelListSuffix)) _lstEndpoints.Items.RemoveAt(i);
             }
         }
 
@@ -1494,8 +1428,6 @@ namespace TurboHost
             {
                 BeginInvoke(new Action(async () =>
                 {
-                    RemoveTunnelEndpointsFromList();
-                    _lstEndpoints.Items.Insert(0, endpoint + TunnelListSuffix);
                     await PublishTicketToCloudDirectoryAsync();
                 }));
             }
@@ -1507,7 +1439,8 @@ namespace TurboHost
             bool autoStart = true;
             for (int i = 0; i < args.Length; i++)
             {
-                if (args[i] == "--port" && i + 1 < args.Length) _txtPort.Text = args[i + 1];
+                int argPort;
+                if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[i + 1], out argPort)) _port = argPort;
                 if (args[i] == "--pin" && i + 1 < args.Length)
                 {
                     _commandLineKey = args[i + 1].Trim();
@@ -1524,30 +1457,10 @@ namespace TurboHost
 
         private void UpdateAdminBadge()
         {
+            // Either the badge or the button: a "Run as admin" button on an admin Host only invited a pointless click.
             bool isAdmin = NativeInputInjector.IsRunningAsAdmin();
-            if (isAdmin)
-            {
-                _lblAdminBadge.Text = "🛡 ADMIN PRIVILEGES: FULL";
-                _lblAdminBadge.BackColor = Color.FromArgb(25, 110, 65);
-                _lblAdminBadge.ForeColor = Color.FromArgb(180, 255, 200);
-            }
-            else
-            {
-                _lblAdminBadge.Text = "⚠ STANDARD USER (Click Elevate)";
-                _lblAdminBadge.BackColor = Color.FromArgb(120, 75, 20);
-                _lblAdminBadge.ForeColor = Color.FromArgb(255, 225, 160);
-            }
-        }
-
-        private void PopulateNetworkEndpoints()
-        {
-            _lstEndpoints.Items.Clear();
-            foreach (string ip in NetworkHelper.GetLocalIpAddresses())
-            {
-                _lstEndpoints.Items.Add(ip);
-            }
-            _lstEndpoints.Items.Add("127.0.0.1 (Localhost Loopback Test)");
-            if (_lstEndpoints.Items.Count > 0) _lstEndpoints.SelectedIndex = 0;
+            _lblAdminBadge.Visible = isAdmin;
+            _btnElevate.Visible = !isAdmin;
         }
 
         private async Task ToggleServerAsync()
@@ -1556,7 +1469,7 @@ namespace TurboHost
             else await StartServerAsync();
         }
 
-        private async Task AutoOpenFirewallUpnpAndTunnelAsync(int port, CancellationToken ct)
+        private async Task AutoOpenFirewallAndTunnelAsync(int port, CancellationToken ct)
         {
             // 1. Automatically open Windows Firewall inbound rule (if running as Admin)
             if (NativeInputInjector.IsRunningAsAdmin())
@@ -1569,19 +1482,13 @@ namespace TurboHost
                 }
             }
 
-            // 2. Automatically probe UPnP Router Gateway to open external port
-            try
-            {
-                string upnpMsg = await NetworkHelper.TryUpnpPortForwardAsync(port, port);
-                Log("[Auto-UPnP] " + upnpMsg);
-            }
-            catch { }
+            // (The old "UPnP" step is gone: it only found the router and never mapped a port.)
 
-            // 3. Decide about the public tunnel from Tailscale's state (re-checked every 30 s by the timer). The
+            // 2. Decide about the public tunnel from Tailscale's state (re-checked every 30 s by the timer). The
             //    tunnel only opens when that decision wants it and the access key is strong enough.
             try { BeginInvoke(new Func<Task>(RefreshTailscaleAsync)); } catch (InvalidOperationException) { }
 
-            // 4. Every 4 minutes, re-publish the Cloud Rendezvous ticket if it changed (new LAN IP, PIN or Host ID)
+            // 3. Every 4 minutes, re-publish the Cloud Rendezvous ticket if it changed (new LAN IP, PIN or Host ID)
             //    or the keep-alive is due, so Internet clients can always find this Host.
             while (_isRunning && !ct.IsCancellationRequested)
             {
@@ -1601,7 +1508,8 @@ namespace TurboHost
         {
             if (_isRunning) return;
             int port;
-            if (!int.TryParse(_txtPort.Text.Trim(), out port) || port < 1 || port > 65535)
+            port = _port;
+            if (port < 1 || port > 65535)
             {
                 MessageBox.Show("Please enter a valid TCP port (1-65535).", "Invalid Port", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -1631,20 +1539,20 @@ namespace TurboHost
                 _hostClock.Restart();
 
                 _isRunning = true;
-                _btnStartStop.Text = "⏹ Stop Host Server";
+                _btnStartStop.Text = "■ Stop sharing";
                 _btnStartStop.BackColor = Color.FromArgb(185, 55, 55);
                 _listenPort = port;
                 _lblStatus.ForeColor = Color.FromArgb(95, 245, 155);
 
-                Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, access key: {2})", port, _txtRoomId.Text, _txtPin.Text));
+                Log(string.Format("[Server] TurboHost listening on 0.0.0.0:{0} (Host ID: {1}, access key: {2})", port, HostId, _txtPin.Text));
                 RememberAccessKey(_txtPin.Text);
                 _lastRefusedKey = null; // say again on every start why Internet access is off
                 ShowListeningStatus(!IsInternetRefusedForKey(_txtPin.Text.Trim()));
 
-                // Automatically open Firewall, map UPnP router port, launch Public Internet Tunnel, and publish to Cloud.
+                // Open Windows Firewall, start the public tunnel when wanted, and publish the addresses to the cloud directory.
                 // Pass THIS server's token so a quick Stop + Start cannot leave two publish loops running.
                 CancellationToken autoToken = cts.Token;
-                Task.Run(() => AutoOpenFirewallUpnpAndTunnelAsync(port, autoToken));
+                Task.Run(() => AutoOpenFirewallAndTunnelAsync(port, autoToken));
 
                 while (!cts.Token.IsCancellationRequested)
                 {
@@ -1683,40 +1591,11 @@ namespace TurboHost
             }
             catch { }
 
-            _btnStartStop.Text = "▶ Start Host Server";
+            _btnStartStop.Text = "▶ Start sharing";
             _btnStartStop.BackColor = Color.FromArgb(34, 155, 95);
-            _lblStatus.Text = "● Server Status: STOPPED";
+            _lblStatus.Text = "● Not sharing";
             _lblStatus.ForeColor = Color.FromArgb(255, 180, 90);
             Log("[Server] Listener and Internet tunnel stopped.");
-        }
-
-        private async Task ConnectReverseToClientAsync()
-        {
-            string host = _txtRelayHost.Text.Trim();
-            int port;
-            if (!int.TryParse(_txtRelayPort.Text.Trim(), out port))
-            {
-                Log("[Reverse] Invalid client port.");
-                return;
-            }
-
-            try
-            {
-                Log(string.Format("[Reverse] Connecting outbound to {0}:{1}...", host, port));
-                TcpClient client = new TcpClient();
-                client.NoDelay = true;
-                await client.ConnectAsync(host, port);
-                Log(string.Format("[Reverse] Connected to {0}:{1}!", host, port));
-                // After "Stop Host Server" the old token is already cancelled, which killed the reverse
-                // session the moment it started.
-                if (_serverCts == null || _serverCts.IsCancellationRequested) _serverCts = new CancellationTokenSource();
-                CancellationToken sessionToken = _serverCts.Token;
-                Task.Run(() => HandleClientSessionAsync(client, sessionToken));
-            }
-            catch (Exception ex)
-            {
-                Log("[Reverse Error] " + ex.Message);
-            }
         }
 
         // Signed-in sessions, so a new sign-in can close the dead ones (see CloseSilentSessions).
@@ -1897,7 +1776,7 @@ namespace TurboHost
             {
                 return (string)Invoke(new Func<string>(BuildElevatedRestartArgs));
             }
-            return string.Format("--host --port {0} --pin \"{1}\"", _txtPort.Text.Trim(), _txtPin.Text.Trim());
+            return string.Format("--host --port {0} --pin \"{1}\"", _port, _txtPin.Text.Trim());
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1955,7 +1834,7 @@ namespace TurboHost
                 BeginInvoke(new Action(() =>
                 {
                     double mb = _totalBytesSent / (1024.0 * 1024.0);
-                    _lblStats.Text = string.Format("Clients: {0} | Stream Out: {1:F1} KB/s | Total Sent: {2:F2} MB", _connectedClients, kbps, mb);
+                    _lblStats.Text = string.Format("Viewers: {0} | Out: {1:F1} KB/s | Sent: {2:F2} MB", _connectedClients, kbps, mb);
                 }));
             }
             catch { }

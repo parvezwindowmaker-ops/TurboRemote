@@ -1183,6 +1183,49 @@ namespace TurboCore
             }
         }
 
+        private const string UnattendedTaskName = "TurboRemote_Unattended_Host";
+
+        /// <summary>Whether the sign-in task exists (any user can query; takes a moment, so call it off the UI thread).</summary>
+        public static bool IsUnattendedStartupTaskInstalled()
+        {
+            return RunSchtasks("/Query /TN \"" + UnattendedTaskName + "\"") == 0;
+        }
+
+        /// <summary>Removes the sign-in task. Needs admin rights, like creating it.</summary>
+        public static bool RemoveUnattendedStartupTask()
+        {
+            return RunSchtasks("/Delete /F /TN \"" + UnattendedTaskName + "\"") == 0;
+        }
+
+        private static int RunSchtasks(string arguments)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", arguments)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    Task<string> o = p.StandardOutput.ReadToEndAsync();
+                    Task<string> e = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(5000))
+                    {
+                        try { p.Kill(); } catch { }
+                        return -1;
+                    }
+                    return p.ExitCode;
+                }
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
         /// <summary>Queues a mouse event; <paramref name="onInjected"/> runs right after it was injected.</summary>
         public static void InjectMouse(MouseActionType action, float normX, float normY, int wheelDelta, int monitorIndex, Action onInjected = null)
         {
@@ -2082,47 +2125,6 @@ namespace TurboCore
             }
         }
 
-        public static async Task<string> TryUpnpPortForwardAsync(int internalPort, int externalPort)
-        {
-            try
-            {
-                string ssdpRequest =
-                    "M-SEARCH * HTTP/1.1\r\n" +
-                    "HOST: 239.255.255.250:1900\r\n" +
-                    "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" +
-                    "MAN: \"ssdp:discover\"\r\n" +
-                    "MX: 2\r\n\r\n";
-
-                using (UdpClient udp = new UdpClient())
-                {
-                    byte[] reqBytes = Encoding.ASCII.GetBytes(ssdpRequest);
-                    IPEndPoint multicastEp = new IPEndPoint(IPAddress.Parse("239.255.255.250"), 1900);
-                    await udp.SendAsync(reqBytes, reqBytes.Length, multicastEp);
-
-                    Task<UdpReceiveResult> receiveTask = udp.ReceiveAsync();
-                    Task completed = await Task.WhenAny(receiveTask, Task.Delay(2200));
-                    if (completed != receiveTask)
-                    {
-                        return "UPnP router discovery timed out (Use Tailscale, Public Tunnel, or Reverse Connect).";
-                    }
-
-                    string response = Encoding.ASCII.GetString(receiveTask.Result.Buffer);
-                    foreach (string line in response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        if (line.StartsWith("LOCATION:", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string loc = line.Substring(9).Trim();
-                            return string.Format("UPnP Gateway detected at {0}. Port {1} ready.", loc, externalPort);
-                        }
-                    }
-                    return "UPnP gateway responded.";
-                }
-            }
-            catch (Exception ex)
-            {
-                return "UPnP status: " + ex.Message;
-            }
-        }
     }
 
     /// <summary>

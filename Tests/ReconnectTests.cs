@@ -92,7 +92,7 @@ class ReconnectTests
 
             // Busy: keep trying.
             host.FailText = null;
-            Uia.Invoke(Wnd, "Connect to Host");
+            Uia.Invoke(Wnd, "⚡ Connect");
             TestKit.WaitUntil(() => host.SessionsAccepted == 5, 10000);
             host.FailText = "Host is busy checking other sign-ins from the Internet. Try again in a minute.";
             before = host.SignInAttempts;
@@ -111,12 +111,12 @@ class ReconnectTests
             Thread.Sleep(1000);
             before = host.SignInAttempts;
             Thread.Sleep(15000);
-            TestKit.Check("Stop ends the retries", host.SignInAttempts == before && Uia.FindText(Wnd, "⚡ Connect to Host") != null,
+            TestKit.Check("Stop ends the retries", host.SignInAttempts == before && Uia.FindText(Wnd, "⚡ Connect") != null,
                 (host.SignInAttempts - before) + " attempts after Stop" + Diag());
             host.FailText = null;
 
             // A different PC answers on the same address: not accepted.
-            Uia.Invoke(Wnd, "Connect to Host");
+            Uia.Invoke(Wnd, "⚡ Connect");
             TestKit.WaitUntil(() => host.SessionsAccepted == 7, 10000);
             host.StopListening();
             host.CloseSession();

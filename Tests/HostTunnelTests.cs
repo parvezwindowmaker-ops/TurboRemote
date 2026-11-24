@@ -52,17 +52,17 @@ class HostTunnelTests
             TestKit.Check("Host shows its permanent Tailscale address", line != null && line.Contains(ts.DnsName) && line.Contains(ts.IPv4), line);
 
             Thread.Sleep(6000); // past the tunnel's usual start-up time
-            string box = Uia.FindText(wnd, "Also open a public tunnel");
+            string box = Uia.FindText(wnd, "Also allow viewers without Tailscale");
             TestKit.Check("public tunnel box is unticked and automatic while Tailscale runs",
-                Uia.IsChecked(wnd, "Also open a public tunnel") == false && box != null && box.Contains("(automatic)"), box);
+                Uia.IsChecked(wnd, "Also allow viewers without Tailscale") == false && box != null && box.Contains("(automatic)"), box);
             TestKit.Check("no public tunnel was opened", SshFor(port).Count == 0, SshFor(port).Count + " ssh.exe for port " + port);
 
-            Uia.Toggle(wnd, "Also open a public tunnel");
+            Uia.Toggle(wnd, "Also allow viewers without Tailscale");
             bool up = TestKit.WaitUntil(() => SshFor(port).Count > 0, 10000);
             TestKit.Check("ticking the box opens the tunnel and remembers 'on'", up && TurboSettings.Get("publicTunnel", "") == "on",
                 "ssh running: " + up + ", setting: " + TurboSettings.Get("publicTunnel", "(none)"));
 
-            Uia.Toggle(wnd, "Also open a public tunnel");
+            Uia.Toggle(wnd, "Also allow viewers without Tailscale");
             bool gone = TestKit.WaitUntil(() => SshFor(port).Count == 0, 5000);
             TestKit.Check("unticking closes it and remembers 'off'", gone && TurboSettings.Get("publicTunnel", "") == "off",
                 "ssh gone: " + gone + ", setting: " + TurboSettings.Get("publicTunnel", "(none)"));

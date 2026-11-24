@@ -16,7 +16,7 @@ namespace TurboUnified
         public UnifiedLauncherForm()
         {
             Text = "TurboRemote  v" + TurboProtocol.AppVersion;
-            Size = new Size(560, 360);
+            Size = new Size(560, 300);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(16, 18, 26);
             ForeColor = Color.FromArgb(230, 235, 245);
@@ -35,7 +35,7 @@ namespace TurboUnified
 
             Label lblSub = new Label
             {
-                Text = "One Single ~100 KB Executable for Both Machines • AES-256 + HMAC-SHA256 E2EE",
+                Text = "Share this PC, or control another one. Encrypted end to end.",
                 Font = new Font("Segoe UI", 9f),
                 ForeColor = Color.FromArgb(160, 180, 210),
                 Location = new Point(26, 50),
@@ -44,7 +44,7 @@ namespace TurboUnified
 
             Button btnHost = new Button
             {
-                Text = "🖥  SHARE THIS PC (Start Host Server)\n     Allow another PC to remotely control this machine",
+                Text = "🖥  Share this PC\n     Let someone you trust control this computer",
                 Location = new Point(26, 92),
                 Size = new Size(492, 66),
                 BackColor = Color.FromArgb(30, 140, 88),
@@ -65,7 +65,7 @@ namespace TurboUnified
 
             Button btnClient = new Button
             {
-                Text = "⚡  CONTROL A REMOTE PC (Start Viewer Client)\n     Connect to a remote Host PC (Desktop, PowerShell & File Manager)",
+                Text = "⚡  Control another PC\n     Connect to a PC that is sharing (desktop, PowerShell, files)",
                 Location = new Point(26, 170),
                 Size = new Size(492, 66),
                 BackColor = Color.FromArgb(55, 95, 175),
@@ -83,29 +83,9 @@ namespace TurboUnified
                 clientForm.Show();
             };
 
-            Button btnBothDemo = new Button
-            {
-                Text = "🚀 Launch Both (Host + Client Auto-Connected on This PC for Testing)",
-                Location = new Point(26, 252),
-                Size = new Size(492, 42),
-                BackColor = Color.FromArgb(95, 65, 155),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
-                Cursor = Cursors.Hand
-            };
-            btnBothDemo.Click += (s, e) =>
-            {
-                string exe = Process.GetCurrentProcess().MainModule.FileName;
-                // This PC's own saved access key, not the old fixed PIN 2580 the whole Internet could guess.
-                string keyNote;
-                string key = AccessKeyStore.LoadOrCreate(out keyNote);
-                Process.Start(exe, "--host --port 9876 --pin \"" + key + "\"");
-                Process.Start(exe, "--client --connect 127.0.0.1 --port 9876 --pin \"" + key + "\"");
-                Close();
-            };
-
-            Controls.AddRange(new Control[] { lblTitle, lblSub, btnHost, btnClient, btnBothDemo });
+            // "Launch Both" (Host + viewer on this one PC) is gone: on one PC the keys the viewer sends land back
+            // in the viewer itself, so the keyboard could never be used and the demo only confused people.
+            Controls.AddRange(new Control[] { lblTitle, lblSub, btnHost, btnClient });
         }
     }
 

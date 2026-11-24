@@ -367,6 +367,27 @@ public static class Uia
         return names;
     }
 
+    /// <summary>The shown value of every drop-down list in the window.</summary>
+    public static List<string> ComboValues(IntPtr hwnd)
+    {
+        List<string> values = new List<string>();
+        foreach (AutomationElement el in All(hwnd))
+        {
+            try
+            {
+                if (el.Current.ControlType != ControlType.ComboBox) continue;
+                object p;
+                if (el.TryGetCurrentPattern(ValuePattern.Pattern, out p)) { values.Add(((ValuePattern)p).Current.Value ?? ""); continue; }
+                if (el.TryGetCurrentPattern(SelectionPattern.Pattern, out p))
+                {
+                    foreach (AutomationElement sel in ((SelectionPattern)p).Current.GetSelection()) values.Add(NameOf(sel));
+                }
+            }
+            catch { }
+        }
+        return values;
+    }
+
     /// <summary>True when some visible control's name contains <paramref name="text"/> (ignoring case).</summary>
     public static bool HasName(IntPtr hwnd, string text)
     {
