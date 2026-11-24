@@ -28,7 +28,8 @@ Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both *
    - Opens TCP port `9876` and UDP LAN Discovery port `9878`.
    - **Automatically opens Windows Firewall** (when running as Admin).
    - **Automatically maps UPnP on your router** for port `9876`.
-   - **Automatically starts and maintains the Public Internet Tunnel** (`tcp://xxxx.run.pinggy-free.link:PORT`) in the background with an auto-reconnect watchdog if the tunnel ever drops. The free tunnel's address changes every 60 minutes; the Host reconnects and re-publishes it on its own.
+   - **Shows your permanent Tailscale address** in Box #3 when Tailscale runs on this PC (recommended, see Case B), e.g. `Tailscale ON — from anywhere, connect to: WM-DEV-07`.
+   - **Public Internet Tunnel as a fallback** (`tcp://xxxx.run.pinggy-free.link:PORT`): opened automatically only when Tailscale is **not** running on this PC (or when you tick *Also open a public tunnel…* in Box #3). The free tunnel's address changes every 60 minutes; the Host reconnects and re-publishes it on its own.
    - **Automatically publishes your encrypted endpoints** under your **Host ID** whenever they change (new tunnel address, IP, access key or Host ID) and refreshes them every 3 hours, so you can connect from anywhere on the Internet at any time.
    - The tunnel and the Host ID publishing only run while the access key is strong enough for the Internet (see step 2).
 2. **Your Access Key**:
@@ -58,25 +59,28 @@ Once you click **🖥 SHARE THIS PC (Start Host Server)**, everything for both *
 
 ### Case B: Connecting Over the Internet (Different Wi-Fi / Anywhere in the World)
 
-Choose whichever of these **3 Internet methods** is easiest for your setup:
+#### ⭐ Recommended: Tailscale (free, permanent address, sessions that last)
+[Tailscale](https://tailscale.com/download) is a free app that puts your PCs on one private network, wherever they are. Each PC gets an address and name that **never change**, and the connection is direct and encrypted, with no router setup. It has a free plan for personal use.
+1. **Install Tailscale on the Host PC and on the Client PC**, and **sign in to the same Tailscale account** on both.
+2. **On the Host PC**: start the Host as usual. Box #3 shows `Tailscale ON — from anywhere, connect to: WM-DEV-07  (wm-dev-07.tailXXXX.ts.net · 100.x.y.z)`. If it says Tailscale is not connected, open the Tailscale app and sign in.
+3. **On the Client PC**: type the Host's **Host ID** (e.g., `WM-DEV-07`) into **Smart Route / IP**, enter the **access key**, and click **`⚡ Connect to Host`**. The viewer tries the office LAN and Tailscale first, so you connect the same way in the office and away from it.
+4. The address never changes and the session never expires. While Tailscale runs, the Host keeps the public tunnel below switched **off**, so the Host is reachable only from your own Tailscale devices and the LAN.
 
-#### Method 1: Built-In Auto Internet Tunnel (Zero Router Setup & Zero VPN Install)
-1. **On the Host PC**: In Box #3, click **`🌍 Auto Internet Tunnel`**.
+> **Sessions reconnect by themselves.** If the connection drops (Wi-Fi switch, network change, the Host PC restarting its network), the viewer keeps the last picture on screen, shows *Connection lost — reconnecting…*, and retries every few seconds until the session is back. Click **`✖ Stop reconnecting`** to give up. A wrong access key is never retried. A connection that goes silent is noticed within 20 s by the viewer and 45 s by the Host.
+
+#### Fallback: Built-In Public Tunnel (for viewer PCs without Tailscale; address changes every hour)
+1. **On the Host PC**: the tunnel opens by itself when Tailscale is **not** running on the Host. With Tailscale running, tick **`Also open a public tunnel for viewers without Tailscale`** in Box #3 (the choice is remembered).
    - This uses Windows' built-in OpenSSH Client (`ssh.exe`) in the background to open a public TCP relay (`tcp://xxxx.run.pinggy-free.link:PORT`). On first use it creates its own sign-in key in `%LOCALAPPDATA%\TurboRemote\tunnel_ed25519`. If the log says `ssh.exe` could not be started, add the **OpenSSH Client** optional feature in Windows Settings.
    - Within 3–5 seconds, the Host log will show:
      `[PUBLIC INTERNET TUNNEL ACTIVE] -> xxxx.run.pinggy-free.link:12345`
      `[Cloud Discovery READY] Client can now type Host ID 'YOUR-PC-NAME' and access key 'K9X4-M7P2' from anywhere on the Internet!`
    - If the log instead says `Internet access is OFF: the access key is too weak...`, click **`🎲`** (or type a stronger key) and the tunnel starts by itself.
 2. **On the Client PC**:
-   - Type the Host's **Host ID** (e.g., `WM-DEV-07`) **or** the tunnel address (`xxxx.run.pinggy-free.link:12345`) into **Smart Route / IP**.
+   - Type the Host's **Host ID** (e.g., `WM-DEV-07`) into **Smart Route / IP**. The tunnel address itself works too, but it changes every hour, so the Host ID is the better choice.
    - Enter the Host's **access key** and click **`⚡ Connect to Host`**. Finding a Host by its Host ID needs this TurboRemote version (or newer) on both PCs.
-   - *Smart Routing Bonus:* If you type the **Host ID** or paste the **Smart Ticket** (`⚡ Copy / Publish ID`), the Client automatically tests Local LAN first and falls back to the Internet Tunnel if you are away from the office!
+   - pinggy cuts the free tunnel every 60 minutes. The viewer then reconnects on its own (by Host ID) through the tunnel's new address.
 
-#### Method 2: Tailscale / ZeroTier Direct P2P (Fastest Internet Speed & Lowest Ping)
-1. If both PCs have **Tailscale** installed, `TurboRemote` automatically detects the `100.x.y.z (Tailscale / Direct P2P WAN)` IP in Box #3 of the Host.
-2. Enter that `100.x.y.z` IP into the Client and click **`⚡ Connect to Host`** for a direct peer-to-peer UDP hole-punched connection.
-
-#### Method 3: Reverse WAN Connection (When Host Is Behind Strict Firewall / CGNAT)
+#### Reverse WAN Connection (When Host Is Behind Strict Firewall / CGNAT)
 1. **On the Client PC**: Click **`📡 Listen Mode (9877)`** on the top toolbar.
 2. **On the Host PC**: In Box #2 (*Reverse WAN Connect*), enter the Client's IP/Host and port `9877`, then click **`🚀 Connect Outbound to Client`**.
 

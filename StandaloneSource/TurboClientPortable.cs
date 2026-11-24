@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -295,6 +296,12 @@ namespace TurboClient
         private long _lastPacketTicks;
         private string _connectedMachine;
 
+        // This PC's own Tailscale state, shown while disconnected (refreshed every 30 s, off the UI thread).
+        private string _ownTailscaleText = "";
+        private bool _ownTailscaleRefreshing;
+        private int _ticksSinceTailscaleCheck;
+        private const string TailscaleHint = "If this PC is outside the Host's network, install Tailscale on both PCs and sign in to the same account.";
+
         private const ushort VK_SNAPSHOT = 0x2C, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_L = 0x4C;
 
         [DllImport("user32.dll")]
@@ -317,6 +324,7 @@ namespace TurboClient
             System.Windows.Forms.Timer statsTimer = new System.Windows.Forms.Timer { Interval = 1000 };
             statsTimer.Tick += async (s, e) => await OnTelemetryTimerTickAsync();
             statsTimer.Start();
+            Shown += async (s, e) => await RefreshOwnTailscaleAsync();
         }
 
         private void InitializeUi()
@@ -453,7 +461,7 @@ namespace TurboClient
 
             _lblTelemetry = new Label
             {
-                Text = "● DISCONNECTED | FPS: 0 | Bandwidth: 0.0 KB/s | RTT: -- ms",
+                Text = "● DISCONNECTED",
                 Location = new Point(868, 52),
                 AutoSize = true,
                 Font = new Font("Consolas", 8.8f, FontStyle.Bold),
@@ -752,7 +760,13 @@ namespace TurboClient
             }
             catch (Exception ex)
             {
-                _lblTelemetry.Text = "● CONNECTION FAILED: " + ex.Message;
+                string message = "● CONNECTION FAILED: " + ex.Message;
+                // A Host ID that cannot be reached from here usually means "not on the Host's LAN": Tailscale fixes that.
+                if (!(ex is AuthRefusedException) && hostInput.Split(',', ';', ' ').Any(t => SmartRouteEngine.LooksLikeHostId(t.Trim().TrimStart('@'))))
+                {
+                    message += "  " + TailscaleHint;
+                }
+                _lblTelemetry.Text = message;
                 _lblTelemetry.ForeColor = Color.FromArgb(255, 110, 110);
                 ResetConnectButton();
             }
@@ -975,6 +989,37 @@ namespace TurboClient
             ResetConnectButton();
             _lblTelemetry.Text = "● DISCONNECTED";
             _lblTelemetry.ForeColor = Color.FromArgb(255, 185, 90);
+            ShowDisconnectedStatus();
+        }
+
+        /// <summary>Off the UI thread: reads this PC's Tailscale state for the status line.</summary>
+        private async Task RefreshOwnTailscaleAsync()
+        {
+            if (_ownTailscaleRefreshing || IsDisposed) return;
+            _ownTailscaleRefreshing = true;
+            try
+            {
+                TailscaleStatus st = await Task.Run(() => TailscaleInfo.Query());
+                if (IsDisposed) return;
+                _ownTailscaleText = st.IsRunning
+                    ? "Tailscale: ON (" + (string.IsNullOrEmpty(st.HostName) ? Environment.MachineName : st.HostName) + ")"
+                    : st.State == TailscaleState.NotInstalled ? "Tailscale: not installed" : "Tailscale: not connected";
+                ShowDisconnectedStatus();
+            }
+            catch { }
+            finally
+            {
+                _ownTailscaleRefreshing = false;
+            }
+        }
+
+        /// <summary>Adds this PC's Tailscale state to a plain "DISCONNECTED" line; failure and stop messages stay.</summary>
+        private void ShowDisconnectedStatus()
+        {
+            if (_isConnected || _isConnecting || _isReconnecting) return;
+            string text = _lblTelemetry.Text;
+            if (text != "● DISCONNECTED" && !text.StartsWith("● DISCONNECTED | ")) return;
+            _lblTelemetry.Text = "● DISCONNECTED" + (_ownTailscaleText.Length > 0 ? " | " + _ownTailscaleText : "");
         }
 
         private async Task ReceivePacketsLoopAsync(NetworkStream sessionStream, SecurityContext sessionSec, CancellationToken ct)
@@ -1648,6 +1693,11 @@ namespace TurboClient
 
                 byte[] pingPayload = BitConverter.GetBytes(Stopwatch.GetTimestamp());
                 await SendPacketSafeAsync(PacketType.Ping, pingPayload);
+            }
+            else if (!_isReconnecting && ++_ticksSinceTailscaleCheck >= 30)
+            {
+                _ticksSinceTailscaleCheck = 0;
+                await RefreshOwnTailscaleAsync();
             }
         }
 

@@ -520,7 +520,7 @@ namespace TurboCore
         /// Shown in both windows and sent by the Host after sign-in, so a viewer can tell when the other PC runs an
         /// older TurboRemote. Builds before this one did not report a version. Bump it with every release.
         /// </summary>
-        public const string AppVersion = "2026.11.23";
+        public const string AppVersion = "2026.11.24";
 
         private static readonly byte[] MagicHeader = new byte[] { 0x54, 0x52, 0x42, 0x4F }; // 'TRBO'
 
@@ -1724,7 +1724,8 @@ namespace TurboCore
             }
         }
 
-        private static bool LooksLikeHostId(string token)
+        /// <summary>A Host ID (machine name) rather than an IP, address, "AUTO" or list.</summary>
+        public static bool LooksLikeHostId(string token)
         {
             return !string.IsNullOrEmpty(token) && !token.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
                    !token.Contains(".") && !token.Contains(":");
