@@ -1689,165 +1689,297 @@ namespace TurboCore
                 return "Localhost Loopback";
             if (host.StartsWith("192.168.") || host.StartsWith("10.") || host.StartsWith("172."))
                 return "Direct Local LAN";
+            if (TailscaleInfo.IsTailscaleAddress(host))
+                return "Tailscale (permanent)";
             if (host.StartsWith("100."))
                 return "Direct P2P Tailscale/WireGuard WAN";
             return "Public Internet / WAN Tunnel";
         }
 
+        /// <summary>The free pinggy tunnel: reachable from anywhere, but cut and given a new address every hour.</summary>
+        public static bool IsPublicTunnelHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            string h = host.ToLowerInvariant();
+            return h.EndsWith(".pinggy.link") || h.EndsWith(".pinggy-free.link") || h.EndsWith(".pinggy.io");
+        }
+
+        private static async Task<TcpClient> DialTcpAsync(EndpointCandidate c, CancellationToken token)
+        {
+            TcpClient tcp = new TcpClient();
+            tcp.NoDelay = true;
+            try
+            {
+                using (token.Register(() => { try { tcp.Close(); } catch { } }))
+                {
+                    await tcp.ConnectAsync(c.Host, c.Port);
+                }
+                if (token.IsCancellationRequested || !tcp.Connected) throw new OperationCanceledException(token);
+                return tcp;
+            }
+            catch
+            {
+                try { tcp.Close(); } catch { }
+                throw;
+            }
+        }
+
+        private static bool LooksLikeHostId(string token)
+        {
+            return !string.IsNullOrEmpty(token) && !token.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
+                   !token.Contains(".") && !token.Contains(":");
+        }
+
+        /// <summary>
+        /// Connects to the Host by whatever the user typed (Host ID, IP, address, or a comma-separated list).
+        /// LAN and Tailscale routes are dialled first. The hourly public tunnel only joins after 2.5 s without a
+        /// direct connection: it used to win the race (its edge answers fast) and the session then died with
+        /// the tunnel's hourly cut.
+        /// </summary>
         public static async Task<KeyValuePair<TcpClient, EndpointCandidate>> RaceFastestConnectionAsync(string hostInput, int defaultPort, string pin, CancellationToken ct)
         {
             string rawInput = hostInput != null ? hostInput.Trim() : "";
-            List<EndpointCandidate> candidates = new List<EndpointCandidate>();
+            bool isAuto = string.IsNullOrEmpty(rawInput) || rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase);
+            ConnectionRace race = new ConnectionRace(DialTcpAsync);
 
-            // 1. Add whatever user typed (IP, Windows Machine Name like WM-DEV-07, or comma-separated list)
-            if (!string.IsNullOrEmpty(rawInput) && !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase))
+            // 1. Whatever the user typed is dialled at once, even a tunnel address they chose on purpose.
+            List<string> hostIds = new List<string>();
+            if (!isAuto)
             {
-                candidates.AddRange(ParseCandidates(rawInput.TrimStart('@'), defaultPort));
+                foreach (string token in rawInput.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string clean = token.Trim().TrimStart('@');
+                    if (LooksLikeHostId(clean) && !hostIds.Contains(clean, StringComparer.OrdinalIgnoreCase)) hostIds.Add(clean);
+                    foreach (EndpointCandidate c in ParseCandidates(clean, defaultPort)) race.AddDirect(c);
+                }
             }
 
-            // A Host ID is looked up in the cloud directory right away, so the HTTPS round trip overlaps the
-            // direct attempt below instead of starting after it.
-            bool looksLikeHostId = !string.IsNullOrEmpty(rawInput) &&
-                                   !rawInput.Equals("AUTO", StringComparison.OrdinalIgnoreCase) &&
-                                   !rawInput.Contains(".") &&
-                                   !rawInput.Contains(":");
-            string cleanRoom = rawInput.TrimStart('@');
-            Task<string> cloudTask = (looksLikeHostId || rawInput.StartsWith("@"))
-                ? ResolveHostTicketFromCloudAsync(cleanRoom, pin)
-                : null;
-
-            // 2. If user typed a single IP or Hostname, try direct fast TCP connect FIRST (700ms fast path!)
-            // If the machine is on Local LAN or direct IP, this connects in 2-15ms without waiting for UDP or Cloud!
-            if (candidates.Count == 1)
+            // 2. LAN broadcast discovery. With Host IDs typed, only a LAN Host of that name is taken: any other
+            //    TurboRemote PC on the LAN could otherwise answer first.
+            Task lanTask = DiscoverLanHostsAsync(300).ContinueWith(t =>
             {
-                EndpointCandidate primary = candidates[0];
-                TcpClient fastTcp = new TcpClient();
-                bool fastPathWon = false;
+                if (t.Status != TaskStatus.RanToCompletion) return;
+                foreach (EndpointCandidate lan in t.Result)
+                {
+                    bool wanted = isAuto || hostIds.Any(id => lan.RouteLabel.IndexOf("(" + id + ")", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (wanted) race.AddDirect(lan);
+                }
+            }, TaskScheduler.Default);
+
+            // 3. Cloud directory lookup for each Host ID: its LAN/Tailscale addresses race at once, its tunnel
+            //    address is held back.
+            List<Task> lookups = new List<Task> { lanTask };
+            foreach (string id in hostIds)
+            {
+                lookups.Add(ResolveHostTicketFromCloudAsync(id, pin).ContinueWith(t =>
+                {
+                    if (t.Status != TaskStatus.RanToCompletion || string.IsNullOrWhiteSpace(t.Result)) return;
+                    foreach (EndpointCandidate cc in ParseCandidates(t.Result, defaultPort))
+                    {
+                        if (IsPublicTunnelHost(cc.Host)) race.AddTunnel(cc);
+                        else race.AddDirect(cc);
+                    }
+                }, TaskScheduler.Default));
+            }
+
+            Task lookupsDone = Task.WhenAll(lookups).ContinueWith(t =>
+            {
+                if (race.CandidateCount == 0)
+                {
+                    race.AddDirect(new EndpointCandidate { Host = "127.0.0.1", Port = defaultPort, RouteLabel = "Localhost" });
+                }
+                race.NoMoreCandidates();
+            }, TaskScheduler.Default);
+
+            try
+            {
+                return await race.RunAsync(ct);
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException("Timed out connecting to " + rawInput + ":" + defaultPort + ". Make sure TurboRemote Host is running.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Races connection attempts: direct candidates (LAN, Tailscale, what the user typed) start at once; public
+    /// tunnel candidates start only after <c>tunnelHoldBackMs</c> without a winner. Every attempt gets its own
+    /// window, so a held-back tunnel is not starved on slow links. Candidates may be added while it runs.
+    /// </summary>
+    public sealed class ConnectionRace
+    {
+        private readonly Func<EndpointCandidate, CancellationToken, Task<TcpClient>> _dial;
+        private readonly int _holdBackMs, _windowMs, _overallMs;
+        private readonly object _lock = new object();
+        private readonly HashSet<string> _seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<EndpointCandidate> _pendingDirect = new List<EndpointCandidate>();
+        private readonly List<EndpointCandidate> _heldTunnels = new List<EndpointCandidate>();
+        private readonly TaskCompletionSource<KeyValuePair<TcpClient, EndpointCandidate>> _result =
+            new TaskCompletionSource<KeyValuePair<TcpClient, EndpointCandidate>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private CancellationTokenSource _raceCts;
+        private bool _running, _holdBackOver, _noMore, _done;
+        private int _inFlight;
+        private Exception _lastError;
+
+        public ConnectionRace(Func<EndpointCandidate, CancellationToken, Task<TcpClient>> dial,
+                              int tunnelHoldBackMs = 2500, int candidateWindowMs = 6000, int overallTimeoutMs = 15000)
+        {
+            _dial = dial;
+            _holdBackMs = tunnelHoldBackMs;
+            _windowMs = candidateWindowMs;
+            _overallMs = overallTimeoutMs;
+        }
+
+        public int CandidateCount { get { lock (_lock) { return _seen.Count; } } }
+
+        public void AddDirect(EndpointCandidate c)
+        {
+            lock (_lock)
+            {
+                if (!IsNew(c)) return;
+                if (_running) StartDial(c);
+                else _pendingDirect.Add(c);
+            }
+        }
+
+        public void AddTunnel(EndpointCandidate c)
+        {
+            lock (_lock)
+            {
+                if (!IsNew(c)) return;
+                if (_running && _holdBackOver) StartDial(c);
+                else _heldTunnels.Add(c);
+            }
+        }
+
+        /// <summary>From now on the race fails as soon as every attempt has failed, instead of at the overall timeout.</summary>
+        public void NoMoreCandidates()
+        {
+            Exception fail;
+            lock (_lock)
+            {
+                _noMore = true;
+                fail = CheckAllFailedLocked();
+            }
+            if (fail != null) _result.TrySetException(fail);
+        }
+
+        public async Task<KeyValuePair<TcpClient, EndpointCandidate>> RunAsync(CancellationToken ct)
+        {
+            Exception fail;
+            lock (_lock)
+            {
+                _raceCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                _running = true;
+                foreach (EndpointCandidate c in _pendingDirect) StartDial(c);
+                _pendingDirect.Clear();
+                fail = CheckAllFailedLocked();
+            }
+            if (fail != null) _result.TrySetException(fail);
+
+            CancellationToken raceToken = _raceCts.Token;
+            Task holdBack = Task.Delay(_holdBackMs, raceToken).ContinueWith(t =>
+            {
+                if (t.IsCanceled) return;
+                Exception f;
+                lock (_lock)
+                {
+                    _holdBackOver = true;
+                    if (!_done)
+                    {
+                        foreach (EndpointCandidate c in _heldTunnels) StartDial(c);
+                    }
+                    _heldTunnels.Clear();
+                    f = CheckAllFailedLocked();
+                }
+                if (f != null) _result.TrySetException(f);
+            }, TaskScheduler.Default);
+
+            Task overall = Task.Delay(_overallMs, raceToken).ContinueWith(t =>
+            {
+                if (t.IsCanceled) return;
+                bool timedOut;
+                lock (_lock)
+                {
+                    timedOut = !_done;
+                    _done = true;
+                }
+                if (timedOut) _result.TrySetException(new TimeoutException("No route to the Host answered within " + (_overallMs / 1000) + " s."));
+            }, TaskScheduler.Default);
+
+            using (ct.Register(() => _result.TrySetCanceled()))
+            {
                 try
                 {
-                    fastTcp.NoDelay = true;
-                    Task fastConnect = fastTcp.ConnectAsync(primary.Host, primary.Port);
-                    Task done = await Task.WhenAny(fastConnect, Task.Delay(700, ct));
-                    ct.ThrowIfCancellationRequested();
-                    if (done == fastConnect)
-                    {
-                        await fastConnect; // throws if refused/unreachable
-                        if (fastTcp.Connected)
-                        {
-                            fastPathWon = true;
-                            return new KeyValuePair<TcpClient, EndpointCandidate>(fastTcp, primary);
-                        }
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch
-                {
-                    // Fall through to UDP LAN broadcast + Cloud Rendezvous below
+                    return await _result.Task;
                 }
                 finally
                 {
-                    // Also close it when the user cancels; it used to leak a half-open connection attempt.
-                    if (!fastPathWon) { try { fastTcp.Close(); } catch { } }
+                    lock (_lock) { _done = true; }
+                    _raceCts.Cancel(); // stops the timers and every attempt still running
                 }
             }
+        }
 
-            ct.ThrowIfCancellationRequested();
+        private bool IsNew(EndpointCandidate c)
+        {
+            return c != null && !_done && _seen.Add(c.Host + ":" + c.Port);
+        }
 
-            // 3. UDP Local LAN Broadcast Discovery (300ms), then the Cloud Rendezvous lookup started above
-            List<EndpointCandidate> lanFound = await DiscoverLanHostsAsync(300);
-            ct.ThrowIfCancellationRequested();
-            foreach (EndpointCandidate lan in lanFound)
+        /// <summary>Caller holds the lock.</summary>
+        private void StartDial(EndpointCandidate c)
+        {
+            _inFlight++;
+            CancellationTokenSource dialCts = CancellationTokenSource.CreateLinkedTokenSource(_raceCts.Token);
+            dialCts.CancelAfter(_windowMs);
+            Task.Run(async () =>
             {
-                if (!candidates.Any(c => c.Host == lan.Host && c.Port == lan.Port))
-                {
-                    candidates.Insert(0, lan);
-                }
-            }
-
-            if (cloudTask != null)
-            {
-                // Over the Internet the cloud ticket is the only way to learn the Host's tunnel address. The
-                // lookup used to be abandoned after 1.2 s, before a typical HTTPS poll had even finished, so
-                // Internet connections by Host ID failed. Skip the wait only when the Host answered on the LAN.
-                bool requestedHostOnLan = lanFound.Any(l =>
-                    l.RouteLabel.IndexOf("(" + cleanRoom + ")", StringComparison.OrdinalIgnoreCase) >= 0);
-                if (!requestedHostOnLan && !cloudTask.IsCompleted)
-                {
-                    await Task.WhenAny(cloudTask, Task.Delay(CloudLookupTimeoutMs, ct));
-                    ct.ThrowIfCancellationRequested();
-                }
-                if (cloudTask.IsCompleted && !string.IsNullOrWhiteSpace(cloudTask.Result))
-                {
-                    foreach (EndpointCandidate cc in ParseCandidates(cloudTask.Result, defaultPort))
-                    {
-                        if (!candidates.Any(c => c.Host == cc.Host && c.Port == cc.Port))
-                            candidates.Add(cc);
-                    }
-                }
-            }
-
-            if (candidates.Count == 0)
-            {
-                candidates.Add(new EndpointCandidate { Host = "127.0.0.1", Port = defaultPort, RouteLabel = "Localhost" });
-            }
-
-            // 4. Race all candidates concurrently with strict 3.5s timeout and instant cancellation support
-            List<TcpClient> openedSockets = new List<TcpClient>();
-            List<Task<KeyValuePair<TcpClient, EndpointCandidate>>> tasks = new List<Task<KeyValuePair<TcpClient, EndpointCandidate>>>();
-            foreach (EndpointCandidate cand in candidates)
-            {
-                EndpointCandidate c = cand;
-                TcpClient tcp = new TcpClient();
-                tcp.NoDelay = true;
-                openedSockets.Add(tcp);
-
-                tasks.Add(Task.Run(async () =>
-                {
-                    await tcp.ConnectAsync(c.Host, c.Port);
-                    return new KeyValuePair<TcpClient, EndpointCandidate>(tcp, c);
-                }));
-            }
-
-            Task timeoutGuard = Task.Delay(3500, ct);
-            Exception lastErr = null;
-            while (tasks.Count > 0)
-            {
-                List<Task> waitList = new List<Task>(tasks);
-                waitList.Add(timeoutGuard);
-
-                Task first = await Task.WhenAny(waitList);
-                if (first == timeoutGuard)
-                {
-                    foreach (TcpClient s in openedSockets) { try { s.Close(); } catch { } }
-                    ct.ThrowIfCancellationRequested();
-                    throw new TimeoutException("Timed out connecting to " + rawInput + ":" + defaultPort + ". Make sure TurboRemote Host is running.");
-                }
-
-                Task<KeyValuePair<TcpClient, EndpointCandidate>> finished = (Task<KeyValuePair<TcpClient, EndpointCandidate>>)first;
-                tasks.Remove(finished);
+                TcpClient client = null;
+                Exception error = null;
                 try
                 {
-                    KeyValuePair<TcpClient, EndpointCandidate> winner = await finished;
-                    foreach (TcpClient s in openedSockets)
-                    {
-                        if (!object.ReferenceEquals(s, winner.Key))
-                        {
-                            try { s.Close(); } catch { }
-                        }
-                    }
-                    return winner;
+                    client = await _dial(c, dialCts.Token);
                 }
                 catch (Exception ex)
                 {
-                    lastErr = ex;
+                    error = ex;
                 }
-            }
 
-            foreach (TcpClient s in openedSockets) { try { s.Close(); } catch { } }
-            throw lastErr ?? new SocketException();
+                bool won = false;
+                Exception fail = null;
+                lock (_lock)
+                {
+                    _inFlight--;
+                    if (client != null && !_done)
+                    {
+                        _done = true;
+                        won = true;
+                    }
+                    else if (client == null)
+                    {
+                        bool windowExpired = dialCts.IsCancellationRequested && !_raceCts.IsCancellationRequested;
+                        _lastError = windowExpired
+                            ? new TimeoutException(c.Host + ":" + c.Port + " did not answer within " + (_windowMs / 1000) + " s.")
+                            : error;
+                        fail = CheckAllFailedLocked();
+                    }
+                }
+
+                if (won) _result.TrySetResult(new KeyValuePair<TcpClient, EndpointCandidate>(client, c));
+                else if (client != null) { try { client.Close(); } catch { } }
+                if (fail != null) _result.TrySetException(fail);
+                dialCts.Dispose();
+            });
+        }
+
+        /// <summary>Caller holds the lock. Returns the error to fail with once nothing is left to try.</summary>
+        private Exception CheckAllFailedLocked()
+        {
+            if (_done || !_running || !_noMore || _inFlight > 0 || _pendingDirect.Count > 0) return null;
+            if (_heldTunnels.Count > 0 && !_holdBackOver) return null; // they still get their turn
+            _done = true;
+            return _lastError ?? new SocketException((int)SocketError.HostNotFound);
         }
     }
 
